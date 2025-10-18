@@ -81,7 +81,6 @@ def get_today_stats(user_id: int) -> Dict[str, int]:
     ensure_user(user_id)
     d = today_str()
     bucket = USER_DAILY_STATS[user_id].setdefault(d, {"treated": 0, "missed": 0, "cases": 0})
-    # garantir les clés
     for k in ("treated", "missed", "cases"):
         bucket.setdefault(k, 0)
     return bucket
@@ -94,14 +93,36 @@ def inc_stat(user_id: int, key: str, delta: int = 1) -> None:
 
 # ----------------- Utils parsing & stats -----------------
 def normalize_phone(s: Optional[str]) -> Optional[str]:
+    """
+    Normalise en format FR national : 0XXXXXXXXX (10 chiffres).
+    - +33XXXXXXXXX  -> 0XXXXXXXXX
+    - 0033XXXXXXXXX -> 0XXXXXXXXX
+    - 9 chiffres sans 0 initial -> préfixe '0'
+    - si commence par 0 et contient >10 chiffres, tronque à 10
+    - renvoie None si non valide
+    """
     if not s:
         return None
     s = s.strip()
-    s = re.sub(r"^(?:\+33|0033)\s*", "0", s)  # +33/0033 -> 0
+
+    # Harmoniser les préfixes internationaux vers '0'
+    s = re.sub(r"^\s*\+33\s*", "0", s)
+    s = re.sub(r"^\s*0033\s*", "0", s)
+
+    # Garder uniquement les chiffres
     digits = re.sub(r"\D", "", s)
-    if len(digits) == 9:
+
+    # Si commence par 0 et trop long (ex: '061234567890'), on garde 10 chiffres
+    if digits.startswith("0") and len(digits) >= 10:
+        digits = digits[:10]
+        return digits if len(digits) == 10 else None
+
+    # Si 9 chiffres et pas de 0 initial -> on ajoute un seul 0
+    if len(digits) == 9 and not digits.startswith("0"):
         digits = "0" + digits
-    return digits or None
+
+    # Valide si exactement 10 chiffres et commence par 0
+    return digits if len(digits) == 10 and digits.startswith("0") else None
 
 def dept_from_cp(cp: Optional[str]) -> Optional[str]:
     if not cp or not re.fullmatch(r"\d{5}", cp):
@@ -305,7 +326,6 @@ async def find_and_reply_number(message: Message, raw_number: str):
         return
 
     if len(matches) == 1:
-        # Affiche la fiche et incrémente "traités" du jour
         await message.answer(render_record(matches[0]))
         inc_stat(user_id, "treated", 1)
         return

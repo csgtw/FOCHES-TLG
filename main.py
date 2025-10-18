@@ -91,7 +91,7 @@ def inc_stat(user_id: int, key: str, delta: int = 1) -> None:
     stats = get_today_stats(user_id)
     stats[key] = stats.get(key, 0) + delta
 
-# ----------------- Utils parsing & stats -----------------
+# ----------------- Utils -----------------
 def normalize_phone(s: Optional[str]) -> Optional[str]:
     """
     Normalise en format FR national : 0XXXXXXXXX (10 chiffres).
@@ -205,14 +205,27 @@ def parse_txt_blocks(content: str) -> List[Dict]:
             results.append(rec)
     return results
 
-# ----------------- Helper "une page à la fois" -----------------
+# ----------------- Helpers callback -----------------
+async def safe_cb_answer(cb: CallbackQuery, text: Optional[str] = None):
+    """Répond au callback si possible, ignore silencieusement si trop vieux/invalid."""
+    try:
+        await cb.answer(text=text)
+    except Exception:
+        pass
+
+# Une seule page à la fois
 async def show_page(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup,
                     photo_url: Optional[str] = None, parse_mode: Optional[str] = None):
-    """Supprime le message courant et renvoie une nouvelle page (photo+caption ou texte)."""
+    """
+    Ferme le callback au plus vite, supprime l'ancien message,
+    puis envoie la nouvelle page (photo+caption ou texte).
+    """
+    await safe_cb_answer(cb)  # ✅ répond tout de suite pour éviter "query is too old"
     try:
         await cb.message.delete()
     except Exception:
         pass
+
     if photo_url:
         await bot.send_photo(
             chat_id=cb.message.chat.id,
@@ -228,7 +241,6 @@ async def show_page(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup,
             reply_markup=kb,
             parse_mode=parse_mode
         )
-    await cb.answer()
 
 # ----------------- Accueil (avec statistiques exactes) -----------------
 async def send_home(chat_id: int, user_id: int):
@@ -389,7 +401,7 @@ async def db_open(cb: CallbackQuery):
     user_id = cb.from_user.id
     name = cb.data.split(":", 2)[2]
     if name not in BASES:
-        await cb.answer("Base introuvable.", show_alert=True)
+        await safe_cb_answer(cb, "Base introuvable.")
         return
     set_active_db(user_id, name)
     text = f"Base sélectionnée : {name}\n\nChoisissez une action."
@@ -465,7 +477,7 @@ async def db_stats(cb: CallbackQuery):
     name = cb.data.split(":", 2)[2]
     meta = BASES.get(name)
     if not meta:
-        await cb.answer("Base introuvable.", show_alert=True)
+        await safe_cb_answer(cb, "Base introuvable.")
         return
 
     total = meta["records"]
@@ -489,7 +501,7 @@ async def db_import_start(cb: CallbackQuery):
     user_id = cb.from_user.id
     name = cb.data.split(":", 2)[2]
     if name not in BASES:
-        await cb.answer("Base introuvable.", show_alert=True)
+        await safe_cb_answer(cb, "Base introuvable.")
         return
     ensure_user(user_id)
     set_active_db(user_id, name)
@@ -582,7 +594,7 @@ async def db_export(cb: CallbackQuery):
     name = cb.data.split(":", 2)[2]
     meta = BASES.get(name)
     if not meta:
-        await cb.answer("Base introuvable.", show_alert=True)
+        await safe_cb_answer(cb, "Base introuvable.")
         return
 
     headers = ["last_name", "first_name", "full_name_raw", "email", "mobile", "voip",
@@ -603,7 +615,7 @@ async def db_export(cb: CallbackQuery):
         document=FSInputFile(tmp_path, filename=f"{name}.csv"),
         caption=f"Export CSV — {name} ({len(meta.get('records_list', []))} fiches)."
     )
-    await cb.answer()
+    await safe_cb_answer(cb)
 
 # ----------------- Supprimer (depuis le menu de la base) -----------------
 @router.callback_query(F.data.startswith("db:drop:"))
@@ -611,10 +623,10 @@ async def db_drop(cb: CallbackQuery):
     user_id = cb.from_user.id
     name = cb.data.split(":", 2)[2]
     if name not in BASES:
-        await cb.answer("Base introuvable.", show_alert=True)
+        await safe_cb_answer(cb, "Base introuvable.")
         return
     if get_active_db(user_id) != name:
-        await cb.answer("Clique d'abord sur la base pour la sélectionner, puis supprime.", show_alert=True)
+        await safe_cb_answer(cb, "Sélectionne d’abord la base, puis supprime.")
         return
 
     text = f"Confirmer la suppression de la base « {name} » ? Action définitive."
@@ -629,13 +641,13 @@ async def db_drop_confirm(cb: CallbackQuery):
     user_id = cb.from_user.id
     name = cb.data.split(":", 2)[2]
     if name not in BASES:
-        await cb.answer("Base introuvable.", show_alert=True)
+        await safe_cb_answer(cb, "Base introuvable.")
         return
     if get_active_db(user_id) != name:
-        await cb.answer("Clique d'abord sur la base pour la sélectionner, puis supprime.", show_alert=True)
+        await safe_cb_answer(cb, "Sélectionne d’abord la base, puis supprime.")
         return
     if len(BASES) == 1:
-        await cb.answer("Impossible: il doit rester au moins une base.", show_alert=True)
+        await safe_cb_answer(cb, "Impossible: il doit rester au moins une base.")
         return
 
     del BASES[name]

@@ -350,7 +350,6 @@ async def send_home(chat_id: int, user_id: int):
     rdv_count = len([r for r in USER_RDV.get(user_id, {}).get(active_db, []) if not r.get("sent") and datetime.fromisoformat(r["at_iso"]) >= datetime.now(TZ)])
 
     text = (
-        "👋 Bienvenue sur FICHES CLIENTS\n\n"
         f"Base active : {active_db}\n\n"
         "Statistiques du jour :\n"
         f"- Clients traités : {nb_contactes}\n"

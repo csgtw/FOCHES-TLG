@@ -19,28 +19,35 @@ app = FastAPI()
 @router.message(CommandStart())
 @router.message(Command("home"))
 async def accueil(message: types.Message):
+    # Valeurs temporaires — à relier plus tard à ta base de données
     active_db = "default"
-    nb_contactes = 0
-    nb_rappels = 0
+    nb_contactes = 0                 # Clients traités aujourd'hui
+    nb_appels_manques = 0            # Appels manqués à traiter
+    nb_dossiers_en_cours = 0         # Dossiers en cours (suivis ouverts)
 
+    # Message d'accueil amélioré
     text = (
-        "Bienvenue.\n"
-        f"Base active : {active_db}\n\n"
-        f"Clients traités aujourd'hui : {nb_contactes}\n"
-        f"Clients à rappeler : {nb_rappels}\n\n"
-        "Choisissez une action :"
+        "Bienvenue sur FICHES CLIENTS.\n\n"
+        f"📁 Base active : {active_db}\n\n"
+        "Statistiques du jour :\n"
+        f"- Clients traités : {nb_contactes}\n"
+        f"- Appels manqués à gérer : {nb_appels_manques}\n"
+        f"- Dossiers en cours : {nb_dossiers_en_cours}\n\n"
+        "Sélectionnez une action ci-dessous pour continuer :"
     )
 
+    # Boutons d’action
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Gérer les bases", callback_data="home:db")],
         [InlineKeyboardButton(text="Rechercher une fiche", callback_data="home:search")],
-        [InlineKeyboardButton(text=f"Appels manqués ({nb_rappels})", callback_data="home:missed")],
-        [InlineKeyboardButton(text="Notes", callback_data="home:notes")],
+        [InlineKeyboardButton(text=f"Appels manqués ({nb_appels_manques})", callback_data="home:missed")],
+        [InlineKeyboardButton(text=f"Dossiers en cours ({nb_dossiers_en_cours})", callback_data="home:cases")],
     ])
 
     # Image d'accueil
     image_url = "https://i.postimg.cc/0jNN08J5/IMG-0294.jpg"
 
+    # Envoi de l’image + texte + boutons
     await message.answer_photo(
         photo=image_url,
         caption=text,

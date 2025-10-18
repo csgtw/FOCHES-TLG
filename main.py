@@ -237,18 +237,18 @@ async def edit_home_like(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup)
         await cb.message.answer(text, reply_markup=kb)
 
 # --- Gérer les bases ---
-@router.callback_query(F.data == "home:db")
-async def open_db_list(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    ensure_user(user_id)
-    text = render_db_list_text(user_id)
-    kb = db_list_keyboard(user_id)
-    await edit_home_like(cb, text, kb)
-    await cb.answer()
-
 @router.callback_query(F.data == "nav:start")
 async def back_to_start(cb: CallbackQuery):
-    await cb.message.answer("Retour à l'accueil : tapez /start")
+    """Relance directement le handler /start"""
+    # On appelle la fonction d'accueil comme si l'utilisateur avait tapé /start
+    fake_message = types.Message(
+        message_id=cb.message.message_id,
+        from_user=cb.from_user,
+        chat=cb.message.chat,
+        date=cb.message.date,
+        text="/start"
+    )
+    await accueil(fake_message)
     await cb.answer()
 
 # --- (autres handlers : use, stats, create, drop, import, etc.) ---

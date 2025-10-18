@@ -598,6 +598,7 @@ async def db_export(cb: CallbackQuery):
     with open(tmp_path, "wb") as f:
         f.write(csv_data)
 
+    # Envoi du fichier (nécessite un message dédié)
     await cb.message.answer_document(
         document=FSInputFile(tmp_path, filename=f"{name}.csv"),
         caption=f"Export CSV — {name} ({len(meta.get('records_list', []))} fiches)."
@@ -671,7 +672,7 @@ async def back_to_start(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗄️ Gérer les bases", callback_data="home:db")],
         [InlineKeyboardButton(text="🔎 Rechercher une fiche", callback_data="home:search")],
-        [InlineKeyboardButton(text=f"📵 Appels manqués ({nb_appels_manqués:=nb_appels_manques})", callback_data="home:missed")],
+        [InlineKeyboardButton(text=f"📵 Appels manqués ({nb_appels_manques})", callback_data="home:missed")],
         [InlineKeyboardButton(text=f"🗂️ Dossiers en cours ({nb_dossiers_en_cours})", callback_data="home:cases")],
     ])
     await show_page(cb, text, kb, photo_url="https://i.postimg.cc/0jNN08J5/IMG-0294.jpg")

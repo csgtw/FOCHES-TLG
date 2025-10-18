@@ -19,7 +19,6 @@ app = FastAPI()
 @router.message(CommandStart())
 @router.message(Command("home"))
 async def accueil(message: types.Message):
-    # placeholders (on branchera sur la DB ensuite)
     active_db = "default"
     nb_contactes = 0
     nb_rappels = 0
@@ -38,7 +37,15 @@ async def accueil(message: types.Message):
         [InlineKeyboardButton(text=f"Appels manqués ({nb_rappels})", callback_data="home:missed")],
         [InlineKeyboardButton(text="Notes", callback_data="home:notes")],
     ])
-    await message.answer(text, reply_markup=kb)
+
+    # Image d'accueil
+    image_url = "https://i.postimg.cc/0jNN08J5/IMG-0294.jpg"
+
+    await message.answer_photo(
+        photo=image_url,
+        caption=text,
+        reply_markup=kb
+    )
 
 # (tu ajouteras ensuite des handlers pour les callback_data ci-dessus)
 

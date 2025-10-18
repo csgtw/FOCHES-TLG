@@ -1,4 +1,4 @@
-aiogram==3.5.0
-fastapi
-uvicorn
-python-dotenv
+aiogram==3.4.1
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+python-dotenv==1.0.1

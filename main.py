@@ -1134,3 +1134,55 @@ async def rdv_scheduler():
 @app.on_event("startup")
 async def on_startup():
     asyncio.create_task(rdv_scheduler())
+
+# ----------------- Voir Clients traités / Dossiers en cours / Appels manqués -----------------
+
+async def show_records_list(cb: CallbackQuery, title: str, rec_ids: List[str], base: str):
+    if not rec_ids:
+        text = f"Aucun {title.lower()} pour le moment."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Retour", callback_data="nav:start")]
+        ])
+        return await show_page(cb, text, kb)
+
+    rows = []
+    for rid in rec_ids[:50]:
+        rec = find_record(base, rid)
+        if not rec:
+            continue
+        name = pretty_name(rec)
+        ville = rec.get("ville") or "—"
+        cp = rec.get("cp") or "—"
+        label = f"{name} — {ville} ({cp})"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"rec:view:{base}:{rid}")])
+
+    rows.append([InlineKeyboardButton(text="Retour", callback_data="nav:start")])
+    text = f"{title} — {len(rec_ids)} fiche(s) :"
+    await show_page(cb, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "home:treated")
+async def show_treated(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    ensure_user(user_id)
+    base = get_active_db(user_id)
+    rec_ids = USER_TREATED.get(user_id, {}).get(base, [])
+    await show_records_list(cb, "Clients traités", rec_ids, base)
+
+
+@router.callback_query(F.data == "home:cases")
+async def show_cases(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    ensure_user(user_id)
+    base = get_active_db(user_id)
+    rec_ids = USER_INPROGRESS.get(user_id, {}).get(base, [])
+    await show_records_list(cb, "Dossiers en cours", rec_ids, base)
+
+
+@router.callback_query(F.data == "home:missed")
+async def show_missed(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    ensure_user(user_id)
+    base = get_active_db(user_id)
+    rec_ids = USER_MISSED.get(user_id, {}).get(base, [])
+    await show_records_list(cb, "Appels manqués", rec_ids, base)

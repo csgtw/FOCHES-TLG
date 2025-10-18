@@ -95,33 +95,18 @@ def inc_stat(user_id: int, key: str, delta: int = 1) -> None:
 def normalize_phone(s: Optional[str]) -> Optional[str]:
     """
     Normalise en format FR national : 0XXXXXXXXX (10 chiffres).
-    - +33XXXXXXXXX  -> 0XXXXXXXXX
-    - 0033XXXXXXXXX -> 0XXXXXXXXX
-    - 9 chiffres sans 0 initial -> préfixe '0'
-    - si commence par 0 et contient >10 chiffres, tronque à 10
-    - renvoie None si non valide
     """
     if not s:
         return None
     s = s.strip()
-
-    # Harmoniser les préfixes internationaux vers '0'
     s = re.sub(r"^\s*\+33\s*", "0", s)
     s = re.sub(r"^\s*0033\s*", "0", s)
-
-    # Garder uniquement les chiffres
     digits = re.sub(r"\D", "", s)
-
-    # Si commence par 0 et trop long (ex: '061234567890'), on garde 10 chiffres
     if digits.startswith("0") and len(digits) >= 10:
         digits = digits[:10]
         return digits if len(digits) == 10 else None
-
-    # Si 9 chiffres et pas de 0 initial -> on ajoute un seul 0
     if len(digits) == 9 and not digits.startswith("0"):
         digits = "0" + digits
-
-    # Valide si exactement 10 chiffres et commence par 0
     return digits if len(digits) == 10 and digits.startswith("0") else None
 
 def dept_from_cp(cp: Optional[str]) -> Optional[str]:
@@ -220,6 +205,31 @@ def parse_txt_blocks(content: str) -> List[Dict]:
             results.append(rec)
     return results
 
+# ----------------- Helper "une page à la fois" -----------------
+async def show_page(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup,
+                    photo_url: Optional[str] = None, parse_mode: Optional[str] = None):
+    """Supprime le message courant et renvoie une nouvelle page (photo+caption ou texte)."""
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    if photo_url:
+        await bot.send_photo(
+            chat_id=cb.message.chat.id,
+            photo=photo_url,
+            caption=text,
+            reply_markup=kb,
+            parse_mode=parse_mode
+        )
+    else:
+        await bot.send_message(
+            chat_id=cb.message.chat.id,
+            text=text,
+            reply_markup=kb,
+            parse_mode=parse_mode
+        )
+    await cb.answer()
+
 # ----------------- Accueil (avec statistiques exactes) -----------------
 async def send_home(chat_id: int, user_id: int):
     active_db = get_active_db(user_id)
@@ -248,8 +258,7 @@ async def send_home(chat_id: int, user_id: int):
     ])
 
     image_url = "https://i.postimg.cc/0jNN08J5/IMG-0294.jpg"
-    await bot.send_photo(chat_id=chat_id, photo=image_url, caption=text,
-                         reply_markup=kb)
+    await bot.send_photo(chat_id=chat_id, photo=image_url, caption=text, reply_markup=kb)
 
 @router.message(CommandStart())
 async def accueil(message: types.Message):
@@ -273,14 +282,7 @@ async def start_search(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Retour", callback_data="nav:start")]
     ])
-    try:
-        await cb.message.edit_caption(caption=text, reply_markup=kb)
-    except Exception:
-        try:
-            await cb.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await cb.message.answer(text, reply_markup=kb)
-    await cb.answer()
+    await show_page(cb, text, kb)
 
 # ----------------- /num : recherche par numéro (commande) -----------------
 def render_record(rec: Dict) -> str:
@@ -364,27 +366,13 @@ def db_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="Retour", callback_data="nav:start")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def edit_home_like(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup):
-    try:
-        await cb.message.edit_caption(caption=text, reply_markup=kb)
-        return
-    except Exception:
-        pass
-    try:
-        await cb.message.edit_text(text, reply_markup=kb)
-        return
-    except Exception:
-        pass
-    await cb.message.answer(text, reply_markup=kb)
-
 @router.callback_query(F.data == "home:db")
 async def open_db_list(cb: CallbackQuery):
     user_id = cb.from_user.id
     ensure_user(user_id)
     text = render_db_list_text_only()
     kb = db_list_keyboard(user_id)
-    await edit_home_like(cb, text, kb)
-    await cb.answer()
+    await show_page(cb, text, kb)
 
 # ----------------- Menu d'une base -----------------
 def base_menu_keyboard(name: str) -> InlineKeyboardMarkup:
@@ -406,8 +394,7 @@ async def db_open(cb: CallbackQuery):
     set_active_db(user_id, name)
     text = f"Base sélectionnée : {name}\n\nChoisissez une action."
     kb = base_menu_keyboard(name)
-    await edit_home_like(cb, text, kb)
-    await cb.answer()
+    await show_page(cb, text, kb)
 
 # ----------------- Saisies texte : nom de base ou numéro recherché -----------------
 @router.message(F.text)
@@ -467,8 +454,7 @@ async def db_create_start(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Retour", callback_data="home:db")]
     ])
-    await edit_home_like(cb, text, kb)
-    await cb.answer()
+    await show_page(cb, text, kb)
 
 # ----------------- Statistiques (départements uniquement) -----------------
 def sorted_dept_counts(counts: Dict[str,int]) -> List[Tuple[str,int]]:
@@ -495,8 +481,7 @@ async def db_stats(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Retour", callback_data=f"db:open:{name}")]
     ])
-    await edit_home_like(cb, text, kb)
-    await cb.answer()
+    await show_page(cb, text, kb)
 
 # ----------------- Import -----------------
 @router.callback_query(F.data.startswith("db:import:"))
@@ -518,8 +503,7 @@ async def db_import_start(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Retour", callback_data=f"db:open:{name}")]
     ])
-    await edit_home_like(cb, text, kb)
-    await cb.answer()
+    await show_page(cb, text, kb)
 
 @router.message(F.document)
 async def handle_import_file(message: Message):
@@ -637,14 +621,7 @@ async def db_drop(cb: CallbackQuery):
         [InlineKeyboardButton(text="Supprimer définitivement", callback_data=f"db:dropconfirm:{name}")],
         [InlineKeyboardButton(text="Retour", callback_data=f"db:open:{name}")]
     ])
-    try:
-        await cb.message.edit_caption(caption=text, reply_markup=kb)
-    except Exception:
-        try:
-            await cb.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await cb.message.answer(text, reply_markup=kb)
-    await cb.answer()
+    await show_page(cb, text, kb)
 
 @router.callback_query(F.data.startswith("db:dropconfirm:"))
 async def db_drop_confirm(cb: CallbackQuery):
@@ -662,22 +639,39 @@ async def db_drop_confirm(cb: CallbackQuery):
 
     del BASES[name]
     set_active_db(user_id, "default" if "default" in BASES else next(iter(BASES.keys())))
-    await cb.answer("Base supprimée.")
 
     text = render_db_list_text_only()
     kb = db_list_keyboard(user_id)
-    try:
-        await cb.message.edit_caption(caption=text, reply_markup=kb)
-    except Exception:
-        try:
-            await cb.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await cb.message.answer(text, reply_markup=kb)
+    await show_page(cb, text, kb)
 
 # ----------------- Retour accueil -----------------
 @router.callback_query(F.data == "nav:start")
 async def back_to_start(cb: CallbackQuery):
     ensure_user(cb.from_user.id)
     USER_STATE[cb.from_user.id]["awaiting_search_number"] = False
-    await send_home(chat_id=cb.message.chat.id, user_id=cb.from_user.id)
-    await cb.answer()
+
+    # Recrée l’accueil comme nouvelle page (photo + boutons)
+    active_db = get_active_db(cb.from_user.id)
+    stats = get_today_stats(cb.from_user.id)
+    nb_contactes = stats.get("treated", 0)
+    nb_appels_manques = stats.get("missed", 0)
+    nb_dossiers_en_cours = stats.get("cases", 0)
+    nb_fiches = BASES.get(active_db, {}).get("records", 0)
+
+    text = (
+        "👋 Bienvenue sur FICHES CLIENTS\n\n"
+        f"Base active : {active_db}\n\n"
+        "Statistiques du jour :\n"
+        f"- Clients traités : {nb_contactes}\n"
+        f"- Appels manqués : {nb_appels_manques}\n"
+        f"- Dossiers en cours : {nb_dossiers_en_cours}\n"
+        f"- Fiches totales : {nb_fiches}\n\n"
+        "Utilisez les boutons ci-dessous ou tapez /start pour revenir à l'accueil."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗄️ Gérer les bases", callback_data="home:db")],
+        [InlineKeyboardButton(text="🔎 Rechercher une fiche", callback_data="home:search")],
+        [InlineKeyboardButton(text=f"📵 Appels manqués ({nb_appels_manqués:=nb_appels_manques})", callback_data="home:missed")],
+        [InlineKeyboardButton(text=f"🗂️ Dossiers en cours ({nb_dossiers_en_cours})", callback_data="home:cases")],
+    ])
+    await show_page(cb, text, kb, photo_url="https://i.postimg.cc/0jNN08J5/IMG-0294.jpg")

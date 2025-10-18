@@ -156,7 +156,7 @@ def parse_txt_block(block: str) -> Optional[Dict]:
     while i < len(lines):
         line = lines[i]
         if line.upper().startswith("IBAN"):
-            m = re_kv.match(line); 
+            m = re_kv.match(line)
             if m:
                 v = m.group(2).strip().replace(" ", "")
                 if re_iban.match(v):

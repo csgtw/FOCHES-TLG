@@ -271,6 +271,76 @@ async def db_open(cb: CallbackQuery):
     await edit_home_like(cb, text, kb)
     await cb.answer()
 
+# ----------------- /num : recherche par numéro (PLACÉ AVANT F.text) -----------------
+def render_record(rec: Dict) -> str:
+    last = rec.get("last_name") or ""
+    first = rec.get("first_name") or ""
+    name = (last + (" - " + first if first else "")) if (last or first) else (rec.get("full_name_raw") or "—")
+    mobile = rec.get("mobile") or "—"
+    voip = rec.get("voip") or "—"
+    email = rec.get("email") or "—"
+    ville = rec.get("ville") or "—"
+    cp = rec.get("cp") or "—"
+    adr = rec.get("adresse") or "—"
+    iban = rec.get("iban") or "—"
+    bic = rec.get("bic") or "—"
+    return (
+        f"Fiche trouvée :\n"
+        f"- Nom : {name}\n"
+        f"- Mobile : {mobile}\n"
+        f"- VoIP : {voip}\n"
+        f"- Email : {email}\n"
+        f"- Adresse : {adr}\n"
+        f"- Ville : {ville} ({cp})\n"
+        f"- IBAN : {iban}\n"
+        f"- BIC : {bic}"
+    )
+
+@router.message(Command("num"))
+async def search_by_number(message: Message):
+    user_id = message.from_user.id
+    ensure_user(user_id)
+    active = get_active_db(user_id)
+
+    # extraire l'argument après /num
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Utilisation : /num 06123456789")
+        return
+
+    raw = parts[1].strip()
+    num = normalize_phone(raw)
+    if not num or not re.fullmatch(r"0\d{9}", num):
+        await message.answer("Numéro invalide. Exemple attendu : 06123456789")
+        return
+
+    base = BASES.get(active, {})
+    records = base.get("records_list", [])
+
+    matches = [r for r in records if r.get("mobile") == num or r.get("voip") == num]
+
+    if not matches:
+        await message.answer(f"Aucune fiche trouvée pour le numéro {num}.")
+        return
+
+    if len(matches) == 1:
+        await message.answer(render_record(matches[0]))
+        return
+
+    # Plusieurs correspondances : liste synthétique
+    lines = [f"{len(matches)} fiches trouvées pour {num} :", ""]
+    for i, r in enumerate(matches[:10], start=1):
+        last = r.get("last_name") or ""
+        first = r.get("first_name") or ""
+        name = (last + (" - " + first if first else "")) if (last or first) else (r.get("full_name_raw") or "—")
+        ville = r.get("ville") or "—"
+        cp = r.get("cp") or "—"
+        lines.append(f"{i}. {name} — {ville} ({cp})")
+    if len(matches) > 10:
+        lines.append("…")
+
+    await message.answer("\n".join(lines))
+
 # ----------------- Créer une base -----------------
 @router.callback_query(F.data == "db:create")
 async def db_create_start(cb: CallbackQuery):
@@ -285,10 +355,13 @@ async def db_create_start(cb: CallbackQuery):
     await edit_home_like(cb, text, kb)
     await cb.answer()
 
+# IMPORTANT : ce handler F.text ne déclenche que si on attend un nom
 @router.message(F.text)
 async def capture_base_name(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
+
+    # On ne capture un nom QUE si on attend réellement un nom
     if not USER_STATE[user_id].get("awaiting_base_name"):
         return
 
@@ -300,15 +373,28 @@ async def capture_base_name(message: Message):
         await message.answer("Ce nom existe déjà. Choisissez-en un autre.")
         return
 
+    # 1) Créer la base vide
     BASES[raw] = {
         "records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0,
         "records_list": [], "dept_counts": {}
     }
     USER_STATE[user_id]["awaiting_base_name"] = False
+
+    # 2) Activer cette base pour cet utilisateur
     set_active_db(user_id, raw)
 
-    text = f"Base créée : {raw}\n\nVous pouvez importer, voir les stats, exporter ou supprimer."
-    kb = base_menu_keyboard(raw)
+    # 3) Demander immédiatement le fichier à importer (pas de menu ici)
+    USER_STATE[user_id]["awaiting_import_for_base"] = raw
+    text = (
+        f"Base créée : {raw}\n\n"
+        "Envoie maintenant le fichier d’import :\n"
+        "- .txt (format fourni), .csv, ou .jsonl\n"
+        "Les gros fichiers peuvent être découpés.\n\n"
+        "Quand l’import sera terminé, j’afficherai le menu de la base."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Retour", callback_data="home:db")]
+    ])
     await message.answer(text, reply_markup=kb)
 
 # ----------------- Statistiques (départements uniquement) -----------------
@@ -521,74 +607,3 @@ async def back_to_start(cb: CallbackQuery):
     ensure_user(cb.from_user.id)
     await send_home(chat_id=cb.message.chat.id, user_id=cb.from_user.id)
     await cb.answer()
-
-# ----------------- /num : recherche par numéro -----------------
-def render_record(rec: Dict) -> str:
-    last = rec.get("last_name") or ""
-    first = rec.get("first_name") or ""
-    name = (last + (" - " + first if first else "")) if (last or first) else (rec.get("full_name_raw") or "—")
-    mobile = rec.get("mobile") or "—"
-    voip = rec.get("voip") or "—"
-    email = rec.get("email") or "—"
-    ville = rec.get("ville") or "—"
-    cp = rec.get("cp") or "—"
-    adr = rec.get("adresse") or "—"
-    iban = rec.get("iban") or "—"
-    bic = rec.get("bic") or "—"
-    return (
-        f"Fiche trouvée :\n"
-        f"- Nom : {name}\n"
-        f"- Mobile : {mobile}\n"
-        f"- VoIP : {voip}\n"
-        f"- Email : {email}\n"
-        f"- Adresse : {adr}\n"
-        f"- Ville : {ville} ({cp})\n"
-        f"- IBAN : {iban}\n"
-        f"- BIC : {bic}"
-    )
-
-@router.message(Command("num"))
-async def search_by_number(message: Message):
-    user_id = message.from_user.id
-    ensure_user(user_id)
-    active = get_active_db(user_id)
-
-    # extraire l'argument après /num
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Utilisation : /num 06123456789")
-        return
-
-    raw = parts[1].strip()
-    num = normalize_phone(raw)
-    if not num or not re.fullmatch(r"0\d{9}", num):
-        await message.answer("Numéro invalide. Exemple attendu : 06123456789")
-        return
-
-    base = BASES.get(active, {})
-    records = base.get("records_list", [])
-
-    matches = [r for r in records if r.get("mobile") == num or r.get("voip") == num]
-
-    if not matches:
-        await message.answer(f"Aucune fiche trouvée pour le numéro {num}.")
-        return
-
-    if len(matches) == 1:
-        await message.answer(render_record(matches[0]))
-        return
-
-    # Plusieurs correspondances : liste synthétique
-    lines = [f"{len(matches)} fiches trouvées pour {num} :", ""]
-    for i, r in enumerate(matches[:10], start=1):
-        last = r.get("last_name") or ""
-        first = r.get("first_name") or ""
-        name = (last + (" - " + first if first else "")) if (last or first) else (r.get("full_name_raw") or "—")
-        ville = r.get("ville") or "—"
-        cp = r.get("cp") or "—"
-        lines.append(f"{i}. {name} — {ville} ({cp})")
-    if len(matches) > 10:
-        lines.append("…")
-
-    await message.answer("\n".join(lines))
-    

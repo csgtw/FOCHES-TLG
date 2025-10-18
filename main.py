@@ -2,9 +2,11 @@
 import os
 import re
 import csv
+import asyncio
+import uuid
 from io import StringIO
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, HTTPException
@@ -20,7 +22,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN environment variable")
 
-TZ = ZoneInfo("Europe/Madrid")
+TZ = ZoneInfo("Europe/Paris")  # pour RDV & stats
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
@@ -54,23 +56,23 @@ BASES: Dict[str, Dict] = {
 }
 USER_PREFS: Dict[int, Dict] = {}
 USER_STATE: Dict[int, Dict] = {}
-# flags possibles:
-# - USER_STATE[user_id]["awaiting_base_name"] = True/False
-# - USER_STATE[user_id]["awaiting_import_for_base"] = <basename> or None
-# - USER_STATE[user_id]["awaiting_search_number"] = True/False
-# - USER_STATE[user_id]["awaiting_note_for"] = {"base": str, "rid": str, "chat_id": int, "message_id": int}
+# flags:
+# - awaiting_base_name: bool
+# - awaiting_import_for_base: str|None
+# - awaiting_search_number: bool
+# - awaiting_note_for: {"base","rid","chat_id","message_id"}|None
+# - awaiting_rdv_for: {"base","rid","chat_id","message_id"}|None
 
 # Stats du jour par utilisateur
-# USER_DAILY_STATS[user_id][datestr] = {"treated": int, "missed": int, "cases": int}
 USER_DAILY_STATS: Dict[int, Dict[str, Dict[str, int]]] = {}
 
-# Listes des fiches marquées par utilisateur et par base
-# USER_TREATED[user_id][base]    = [rid, ...]
-# USER_MISSED[user_id][base]     = [rid, ...]
-# USER_INPROGRESS[user_id][base] = [rid, ...]
+# Listes des fiches marquées
 USER_TREATED: Dict[int, Dict[str, List[str]]] = {}
 USER_MISSED: Dict[int, Dict[str, List[str]]] = {}
 USER_INPROGRESS: Dict[int, Dict[str, List[str]]] = {}
+
+# RDV: USER_RDV[user_id][base] = [{"id","rid","at_iso","remind_iso","sent","chat_id"}]
+USER_RDV: Dict[int, Dict[str, List[Dict]]] = {}
 
 def ensure_user(user_id: int) -> None:
     USER_PREFS.setdefault(user_id, {"active_db": "default"})
@@ -79,6 +81,7 @@ def ensure_user(user_id: int) -> None:
     USER_TREATED.setdefault(user_id, {})
     USER_MISSED.setdefault(user_id, {})
     USER_INPROGRESS.setdefault(user_id, {})
+    USER_RDV.setdefault(user_id, {})
 
 def get_active_db(user_id: int) -> str:
     return USER_PREFS.get(user_id, {}).get("active_db", "default")
@@ -88,6 +91,7 @@ def set_active_db(user_id: int, dbname: str) -> None:
     USER_TREATED[user_id].setdefault(dbname, [])
     USER_MISSED[user_id].setdefault(dbname, [])
     USER_INPROGRESS[user_id].setdefault(dbname, [])
+    USER_RDV[user_id].setdefault(dbname, [])
 
 def today_str() -> str:
     return datetime.now(TZ).date().isoformat()
@@ -140,7 +144,8 @@ def parse_txt_block(block: str) -> Optional[Dict]:
         "first_name": None, "last_name": None, "dob": None,
         "email": None, "statut": None, "adresse": None,
         "ville": None, "cp": None, "mobile": None, "voip": None,
-        "notes": []
+        "notes": [],
+        "next_rdv_iso": None
     }
 
     re_kv = re.compile(r"^\s*([A-Za-zÉÈÊËÀÂÄÔÖÎÏÛÜÇéèêëàâäôöîïûüç\s/.-]+)\s*:\s*(.+?)\s*$")
@@ -151,7 +156,7 @@ def parse_txt_block(block: str) -> Optional[Dict]:
     while i < len(lines):
         line = lines[i]
         if line.upper().startswith("IBAN"):
-            m = re_kv.match(line)
+            m = re_kv.match(line); 
             if m:
                 v = m.group(2).strip().replace(" ", "")
                 if re_iban.match(v):
@@ -228,14 +233,13 @@ async def safe_cb_answer(cb: CallbackQuery, text: Optional[str] = None):
         pass
 
 def ensure_record_ids(base_name: str):
-    """Assigne un rid unique à chaque fiche d'une base si manquant."""
     base = BASES.get(base_name, {})
     lst = base.get("records_list", [])
     for idx, r in enumerate(lst):
         if not r.get("rid"):
             r["rid"] = str(idx)
 
-# Une seule page à la fois (pour la navigation)
+# Une seule page à la fois (navigation)
 async def show_page(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup,
                     photo_url: Optional[str] = None, parse_mode: Optional[str] = None):
     await safe_cb_answer(cb)
@@ -265,6 +269,9 @@ def pretty_name(rec: Dict) -> str:
     first = rec.get("first_name") or ""
     return (last + (" - " + first if first else "")) if (last or first) else (rec.get("full_name_raw") or "—")
 
+def format_dt_short(dt: datetime) -> str:
+    return dt.astimezone(TZ).strftime("%d/%m %H:%M")
+
 def render_record_text(rec: Dict) -> str:
     name = pretty_name(rec)
     mobile = rec.get("mobile") or "—"
@@ -278,8 +285,15 @@ def render_record_text(rec: Dict) -> str:
     notes_list = rec.get("notes") or []
     notes_block = ""
     if notes_list:
-        lines = [f"- {n}" for n in notes_list[-10:]]  # montre les 10 dernières
+        lines = [f"- {n}" for n in notes_list[-10:]]
         notes_block = "\n\nNotes :\n" + "\n".join(lines)
+    rdv_block = ""
+    if rec.get("next_rdv_iso"):
+        try:
+            dt = datetime.fromisoformat(rec["next_rdv_iso"])
+            rdv_block = f"\n- RDV : {format_dt_short(dt)}"
+        except Exception:
+            pass
     return (
         "Fiche\n"
         f"- Nom : {name}\n"
@@ -290,20 +304,25 @@ def render_record_text(rec: Dict) -> str:
         f"- Ville : {ville} ({cp})\n"
         f"- IBAN : {iban}\n"
         f"- BIC : {bic}"
+        f"{rdv_block}"
         f"{notes_block}"
     )
 
-def record_keyboard(base: str, rid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📞 En ligne",        callback_data=f"rec:ongoing:{base}:{rid}")],
-        [InlineKeyboardButton(text="🟢 Fin d’appel",     callback_data=f"rec:finish:{base}:{rid}")],
-        [InlineKeyboardButton(text="❌ Non traité",      callback_data=f"rec:missed:{base}:{rid}")],
+def record_keyboard(base: str, rid: str, rec: Optional[Dict] = None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📞 En ligne",         callback_data=f"rec:ongoing:{base}:{rid}")],
+        [InlineKeyboardButton(text="🟢 Fin d’appel",      callback_data=f"rec:finish:{base}:{rid}")],
+        [InlineKeyboardButton(text="❌ Non traité",       callback_data=f"rec:missed:{base}:{rid}")],
         [InlineKeyboardButton(text="📝 Ajouter une note", callback_data=f"rec:note:{base}:{rid}")],
-    ])
+        [InlineKeyboardButton(text="📅 Placer un RDV",    callback_data=f"rec:rdv:{base}:{rid}")],
+    ]
+    if rec and rec.get("next_rdv_iso"):
+        rows.append([InlineKeyboardButton(text="🗑️ Annuler RDV", callback_data=f"rec:rdv_cancel:{base}:{rid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def send_record_card(chat_id: int, base: str, rec: Dict):
     text = render_record_text(rec)
-    kb = record_keyboard(base, rec.get("rid", "0"))
+    kb = record_keyboard(base, rec.get("rid", "0"), rec)
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 def find_record(base: str, rid: str) -> Optional[Dict]:
@@ -321,20 +340,22 @@ async def send_home(chat_id: int, user_id: int):
     active_db = get_active_db(user_id)
     stats = get_today_stats(user_id)
     nb_contactes = stats.get("treated", 0)
-    nb_appels_manques = stats.get("missed", 0)
-    nb_dossiers_en_cours_jour = stats.get("cases", 0)  # stats du jour
+    nb_appels_manques_day = stats.get("missed", 0)  # stats (jour)
+    nb_dossiers_en_cours_day = stats.get("cases", 0)
     nb_fiches = BASES.get(active_db, {}).get("records", 0)
 
     treated_count = len(USER_TREATED.get(user_id, {}).get(active_db, []))
     inprogress_count = len(USER_INPROGRESS.get(user_id, {}).get(active_db, []))
+    missed_count = len(USER_MISSED.get(user_id, {}).get(active_db, []))
+    rdv_count = len([r for r in USER_RDV.get(user_id, {}).get(active_db, []) if not r.get("sent") and datetime.fromisoformat(r["at_iso"]) >= datetime.now(TZ)])
 
     text = (
         "👋 Bienvenue sur FICHES CLIENTS\n\n"
         f"Base active : {active_db}\n\n"
         "Statistiques du jour :\n"
         f"- Clients traités : {nb_contactes}\n"
-        f"- Appels manqués : {nb_appels_manques}\n"
-        f"- Dossiers en cours : {nb_dossiers_en_cours_jour}\n"
+        f"- Appels manqués : {nb_appels_manques_day}\n"
+        f"- Dossiers en cours : {nb_dossiers_en_cours_day}\n"
         f"- Fiches totales : {nb_fiches}\n\n"
         "Utilisez les boutons ci-dessous ou tapez /start pour revenir à l'accueil."
     )
@@ -344,7 +365,8 @@ async def send_home(chat_id: int, user_id: int):
         [InlineKeyboardButton(text="🔎 Rechercher une fiche", callback_data="home:search")],
         [InlineKeyboardButton(text=f"✅ Clients traités ({treated_count})", callback_data="home:treated")],
         [InlineKeyboardButton(text=f"🗂️ Dossiers en cours ({inprogress_count})", callback_data="home:cases")],
-        [InlineKeyboardButton(text=f"📵 Appels manqués ({nb_appels_manques})", callback_data="home:missed")],
+        [InlineKeyboardButton(text=f"📵 Appels manqués ({missed_count})", callback_data="home:missed")],
+        [InlineKeyboardButton(text=f"📅 RDV programmés ({rdv_count})", callback_data="home:rdv")],
     ])
 
     image_url = "https://i.postimg.cc/0jNN08J5/IMG-0294.jpg"
@@ -398,7 +420,6 @@ async def find_and_reply_number(message: Message, raw_number: str):
         await send_record_card(message.chat.id, active, matches[0])
         return
 
-    # Plusieurs fiches : petit listing + boutons pour ouvrir
     lines = [f"{len(matches)} fiches trouvées pour {num} :", ""]
     buttons = []
     for r in matches[:10]:
@@ -420,7 +441,7 @@ async def search_by_number_cmd(message: Message):
         return
     await find_and_reply_number(message, parts[1])
 
-# ----------------- Voir fiche via bouton (depuis listes) -----------------
+# ----------------- Voir fiche via bouton -----------------
 @router.callback_query(F.data.startswith("rec:view:"))
 async def rec_view(cb: CallbackQuery):
     # rec:view:<base>:<rid>
@@ -478,13 +499,25 @@ async def db_open(cb: CallbackQuery):
     kb = base_menu_keyboard(name)
     await show_page(cb, text, kb)
 
-# ----------------- Saisies texte : nom de base ou numéro recherché / note -----------------
+# ----------------- Saisies texte : nom / recherche / note / rdv -----------------
+def parse_time_fr(s: str) -> Optional[Tuple[int, int]]:
+    s = (s or "").strip().lower().replace(" ", "")
+    # 16h30 | 16:30 | 1630 | 16h
+    m = re.match(r"^(\d{1,2})h?[:]?(\d{2})?$", s)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2) or "00")
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return hh, mm
+
 @router.message(F.text)
-async def capture_search_or_name_or_note(message: Message):
+async def capture_text(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
 
-    # Note en attente ?
+    # ---- Note en attente
     note_target = USER_STATE[user_id].get("awaiting_note_for")
     if note_target:
         base = note_target["base"]; rid = note_target["rid"]
@@ -495,25 +528,63 @@ async def capture_search_or_name_or_note(message: Message):
             await message.answer("Fiche introuvable pour ajouter la note.")
             return
         rec.setdefault("notes", []).append(message.text.strip())
-        # Met à jour le message de la fiche avec la note ajoutée
-        try:
-            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=None)
-        except Exception:
-            pass
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
                 text=render_record_text(rec),
-                reply_markup=record_keyboard(base, rid)
+                reply_markup=record_keyboard(base, rid, rec)
             )
         except Exception:
-            # si l’édition échoue (ex: message trop ancien), on renvoie une nouvelle fiche
             await send_record_card(message.chat.id, base, rec)
         await message.answer("✅ Note ajoutée.")
         return
 
-    # Création base : on attend un nom
+    # ---- RDV en attente
+    rdv_target = USER_STATE[user_id].get("awaiting_rdv_for")
+    if rdv_target:
+        base = rdv_target["base"]; rid = rdv_target["rid"]
+        chat_id = rdv_target["chat_id"]; msg_id = rdv_target["message_id"]
+        USER_STATE[user_id]["awaiting_rdv_for"] = None
+        hm = parse_time_fr(message.text or "")
+        if not hm:
+            await message.answer("Heure invalide. Exemples : 16h30, 16:30, 1630, 16h")
+            return
+        h, m = hm
+        now = datetime.now(TZ)
+        at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if at <= now:
+            at = at + timedelta(days=1)  # si passé, demain
+        remind = at - timedelta(minutes=5)
+
+        rdv_id = uuid.uuid4().hex
+        USER_RDV[user_id].setdefault(base, []).append({
+            "id": rdv_id,
+            "rid": rid,
+            "at_iso": at.isoformat(),
+            "remind_iso": remind.isoformat(),
+            "sent": False,
+            "chat_id": message.chat.id
+        })
+
+        rec = find_record(base, rid)
+        if rec:
+            # met à jour prochain RDV
+            rec["next_rdv_iso"] = at.isoformat()
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=render_record_text(rec),
+                    reply_markup=record_keyboard(base, rid, rec)
+                )
+            except Exception:
+                await send_record_card(message.chat.id, base, rec)
+
+        await message.answer(f"📅 RDV placé pour {format_dt_short(at)} (rappel 5 min avant).")
+        return
+
+    # ---- Création base : on attend un nom
     if USER_STATE[user_id].get("awaiting_base_name"):
         raw = (message.text or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_]{1,40}", raw):
@@ -544,7 +615,7 @@ async def capture_search_or_name_or_note(message: Message):
         await message.answer(text, reply_markup=kb)
         return
 
-    # Recherche par numéro
+    # ---- Recherche par numéro
     if USER_STATE[user_id].get("awaiting_search_number"):
         USER_STATE[user_id]["awaiting_search_number"] = False
         await find_and_reply_number(message, message.text or "")
@@ -552,7 +623,7 @@ async def capture_search_or_name_or_note(message: Message):
 
     return  # autres textes ignorés
 
-# ----------------- Créer une base (déclenche saisie nom) -----------------
+# ----------------- Créer une base -----------------
 @router.callback_query(F.data == "db:create")
 async def db_create_start(cb: CallbackQuery):
     user_id = cb.from_user.id
@@ -648,7 +719,7 @@ async def handle_import_file(message: Message):
                 dept = dept_from_cp(r.get("cp"))
                 r["dept"] = dept
                 r.setdefault("notes", [])
-                # rid avant append
+                r.setdefault("next_rdv_iso", None)
                 r["rid"] = str(len(BASES[target]["records_list"]))
                 BASES[target]["records_list"].append(r)
                 added_records += 1
@@ -699,7 +770,7 @@ async def db_export(cb: CallbackQuery):
         return
 
     headers = ["rid", "last_name", "first_name", "full_name_raw", "email", "mobile", "voip",
-               "ville", "cp", "dept", "adresse", "iban", "bic", "dob", "statut", "notes"]
+               "ville", "cp", "dept", "adresse", "iban", "bic", "dob", "statut", "notes", "next_rdv_iso"]
     buf = StringIO()
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
     writer.writeheader()
@@ -760,7 +831,7 @@ async def db_drop_confirm(cb: CallbackQuery):
     kb = db_list_keyboard(user_id)
     await show_page(cb, text, kb)
 
-# ----------------- Actions fiche: En ligne / Fin d’appel / Non traité / Note -----------------
+# ----------------- Actions fiche -----------------
 @router.callback_query(F.data.startswith("rec:ongoing:"))
 async def rec_mark_ongoing(cb: CallbackQuery):
     # rec:ongoing:<base>:<rid>
@@ -773,10 +844,15 @@ async def rec_mark_ongoing(cb: CallbackQuery):
     set_active_db(user_id, base)
     ensure_record_ids(base)
 
-    lst = USER_INPROGRESS[user_id].setdefault(base, [])
-    if rid not in lst:
-        lst.append(rid)
+    inprog = USER_INPROGRESS[user_id].setdefault(base, [])
+    if rid not in inprog:
+        inprog.append(rid)
         inc_stat(user_id, "cases", 1)
+
+    missed = USER_MISSED[user_id].setdefault(base, [])
+    if rid in missed:
+        missed.remove(rid)
+
     await safe_cb_answer(cb, "📞 Mis en 'Dossiers en cours'.")
 
 @router.callback_query(F.data.startswith("rec:finish:"))
@@ -791,13 +867,15 @@ async def rec_finish_call(cb: CallbackQuery):
     set_active_db(user_id, base)
     ensure_record_ids(base)
 
-    # Retire des en-cours (si présent) -> décrémente cases
     inprog = USER_INPROGRESS[user_id].setdefault(base, [])
     if rid in inprog:
         inprog.remove(rid)
         inc_stat(user_id, "cases", -1)
 
-    # Ajoute aux traités (si nouveau) -> incrémente treated
+    missed = USER_MISSED[user_id].setdefault(base, [])
+    if rid in missed:
+        missed.remove(rid)
+
     treated = USER_TREATED[user_id].setdefault(base, [])
     if rid not in treated:
         treated.append(rid)
@@ -817,19 +895,17 @@ async def rec_mark_missed(cb: CallbackQuery):
     set_active_db(user_id, base)
     ensure_record_ids(base)
 
-    # Sort des en-cours si présent
     inprog = USER_INPROGRESS[user_id].setdefault(base, [])
     if rid in inprog:
         inprog.remove(rid)
         inc_stat(user_id, "cases", -1)
 
-    # Ajoute aux manqués
     missed = USER_MISSED[user_id].setdefault(base, [])
     if rid not in missed:
         missed.append(rid)
         inc_stat(user_id, "missed", 1)
 
-    await safe_cb_answer(cb, "❌ Marqué comme non traité.")
+    await safe_cb_answer(cb, "❌ Marqué comme non traité (Appels manqués).")
 
 # ----------------- Ajouter une note -----------------
 @router.callback_query(F.data.startswith("rec:note:"))
@@ -852,58 +928,136 @@ async def rec_note_start(cb: CallbackQuery):
     }
     await safe_cb_answer(cb, "Envoie maintenant le texte de la note.")
 
-# ----------------- Listes: traités / en cours -----------------
-@router.callback_query(F.data == "home:treated")
-async def list_treated(cb: CallbackQuery):
+# ----------------- Helpers RDV -----------------
+def get_upcoming_rdvs(user_id: int, base: str, rid: Optional[str] = None):
+    """Liste des RDV futurs non envoyés, triés par date. Si rid=None, tous."""
+    now = datetime.now(TZ)
+    out = []
+    for it in USER_RDV.get(user_id, {}).get(base, []):
+        if it.get("sent"):
+            continue
+        if rid and it.get("rid") != rid:
+            continue
+        try:
+            at = datetime.fromisoformat(it["at_iso"])
+        except Exception:
+            continue
+        if at >= now:
+            out.append((at, it))
+    out.sort(key=lambda x: x[0])
+    return out
+
+def _refresh_record_next_rdv(user_id: int, base: str, rid: str):
+    rec = find_record(base, rid)
+    if not rec:
+        return
+    upcoming = get_upcoming_rdvs(user_id, base, rid)
+    if upcoming:
+        rec["next_rdv_iso"] = upcoming[0][0].isoformat()
+    else:
+        rec["next_rdv_iso"] = None
+
+def _cancel_rdv_by_id(user_id: int, base: str, rdv_id: str) -> bool:
+    lst = USER_RDV.get(user_id, {}).get(base, [])
+    if not lst:
+        return False
+    kept = []
+    cancelled = False
+    target_rid = None
+    for it in lst:
+        if it.get("id") == rdv_id and not it.get("sent"):
+            cancelled = True
+            target_rid = it.get("rid")
+            continue
+        kept.append(it)
+    if cancelled:
+        USER_RDV[user_id][base] = kept
+        if target_rid:
+            _refresh_record_next_rdv(user_id, base, target_rid)
+    return cancelled
+
+# ----------------- Placer / Lister / Annuler un RDV -----------------
+@router.callback_query(F.data.startswith("rec:rdv:"))
+async def rec_rdv_start(cb: CallbackQuery):
+    # rec:rdv:<base>:<rid>
+    try:
+        _, _, base, rid = cb.data.split(":", 3)
+    except Exception:
+        return await safe_cb_answer(cb)
+    user_id = cb.from_user.id
+    ensure_user(user_id)
+    rec = find_record(base, rid)
+    if not rec:
+        return await safe_cb_answer(cb, "Fiche introuvable.")
+
+    USER_STATE[user_id]["awaiting_rdv_for"] = {
+        "base": base,
+        "rid": rid,
+        "chat_id": cb.message.chat.id,
+        "message_id": cb.message.message_id
+    }
+    await safe_cb_answer(cb, "Envoie l’heure du RDV (ex: 16h30, 16:30, 1630).")
+
+@router.callback_query(F.data.startswith("rec:rdv_cancel:"))
+async def rec_rdv_cancel(cb: CallbackQuery):
+    # rec:rdv_cancel:<base>:<rid>  -> Affiche la liste des RDV futurs pour cette fiche
+    try:
+        _, _, base, rid = cb.data.split(":", 3)
+    except Exception:
+        return await safe_cb_answer(cb)
+    user_id = cb.from_user.id
+    ensure_user(user_id)
+
+    upcoming = get_upcoming_rdvs(user_id, base, rid)
+    if not upcoming:
+        return await safe_cb_answer(cb, "Aucun RDV futur à annuler pour cette fiche.")
+
+    text = "RDV de cette fiche (sélectionne à annuler) :"
+    rows = []
+    for at, it in upcoming[:25]:
+        label = f"🗑️ {format_dt_short(at)}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"rdv:cancel_one:{base}:{it['rid']}:{it['id']}")])
+    rows.append([InlineKeyboardButton(text="Retour fiche", callback_data=f"rec:view:{base}:{rid}")])
+    await show_page(cb, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+@router.callback_query(F.data.startswith("rdv:cancel_one:"))
+async def rdv_cancel_one(cb: CallbackQuery):
+    # rdv:cancel_one:<base>:<rid>:<rdv_id>
+    try:
+        _, _, base, rid, rdv_id = cb.data.split(":", 4)
+    except Exception:
+        return await safe_cb_answer(cb)
+    user_id = cb.from_user.id
+    ensure_user(user_id)
+    ok = _cancel_rdv_by_id(user_id, base, rdv_id)
+    await safe_cb_answer(cb, "🗑️ RDV annulé." if ok else "RDV introuvable ou déjà passé.")
+    # Retour à la fiche (rafraîchie)
+    rec = find_record(base, rid)
+    if rec:
+        await send_record_card(cb.message.chat.id, base, rec)
+
+@router.callback_query(F.data == "home:rdv")
+async def list_rdv(cb: CallbackQuery):
     user_id = cb.from_user.id
     ensure_user(user_id)
     base = get_active_db(user_id)
-    ensure_record_ids(base)
-    treated = USER_TREATED[user_id].get(base, []) or []
-    text = f"Clients traités — base {base}\n\n"
-    if not treated:
-        text += "Aucun client traité pour le moment."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Retour", callback_data="nav:start")]
-        ])
+    upcoming = get_upcoming_rdvs(user_id, base, rid=None)
+    text = f"RDV programmés — base {base}\n\n"
+    if not upcoming:
+        text += "Aucun RDV à venir."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Retour", callback_data="nav:start")]])
         return await show_page(cb, text, kb)
-
     rows = []
-    for rid in treated[-50:][::-1]:  # derniers d'abord
-        rec = find_record(base, rid)
-        if not rec:
-            continue
-        label = f"{pretty_name(rec)} — {rec.get('ville') or '—'} ({rec.get('cp') or '—'})"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"rec:view:{base}:{rid}")])
-    rows.append([InlineKeyboardButton(text="Retour", callback_data="nav:start")])
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await show_page(cb, text.strip(), kb)
-
-@router.callback_query(F.data == "home:cases")
-async def list_cases(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    ensure_user(user_id)
-    base = get_active_db(user_id)
-    ensure_record_ids(base)
-    inprog = USER_INPROGRESS[user_id].get(base, []) or []
-    text = f"Dossiers en cours — base {base}\n\n"
-    if not inprog:
-        text += "Aucun dossier en cours."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Retour", callback_data="nav:start")]
+    for at, it in upcoming[:50]:
+        rec = find_record(base, it["rid"])
+        who = f"{pretty_name(rec) if rec else 'Fiche'}"
+        # 2 boutons : ouvrir + annuler ce RDV précisément
+        rows.append([
+            InlineKeyboardButton(text=f"⏱ {format_dt_short(at)} — {who}", callback_data=f"rec:view:{base}:{it['rid']}"),
+            InlineKeyboardButton(text="🗑️ Annuler", callback_data=f"rdv:cancel_one:{base}:{it['rid']}:{it['id']}")
         ])
-        return await show_page(cb, text, kb)
-
-    rows = []
-    for rid in inprog[-50:][::-1]:
-        rec = find_record(base, rid)
-        if not rec:
-            continue
-        label = f"{pretty_name(rec)} — {rec.get('ville') or '—'} ({rec.get('cp') or '—'})"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"rec:view:{base}:{rid}")])
     rows.append([InlineKeyboardButton(text="Retour", callback_data="nav:start")])
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await show_page(cb, text.strip(), kb)
+    await show_page(cb, text.strip(), InlineKeyboardMarkup(inline_keyboard=rows))
 
 # ----------------- Retour accueil -----------------
 @router.callback_query(F.data == "nav:start")
@@ -914,20 +1068,22 @@ async def back_to_start(cb: CallbackQuery):
     active_db = get_active_db(cb.from_user.id)
     stats = get_today_stats(cb.from_user.id)
     nb_contactes = stats.get("treated", 0)
-    nb_appels_manques = stats.get("missed", 0)
-    nb_dossiers_en_cours_jour = stats.get("cases", 0)
+    nb_appels_manques_day = stats.get("missed", 0)
+    nb_dossiers_en_cours_day = stats.get("cases", 0)
     nb_fiches = BASES.get(active_db, {}).get("records", 0)
 
     treated_count = len(USER_TREATED.get(cb.from_user.id, {}).get(active_db, []))
     inprogress_count = len(USER_INPROGRESS.get(cb.from_user.id, {}).get(active_db, []))
+    missed_count = len(USER_MISSED.get(cb.from_user.id, {}).get(active_db, []))
+    rdv_count = len([r for r in USER_RDV.get(cb.from_user.id, {}).get(active_db, []) if not r.get("sent") and datetime.fromisoformat(r["at_iso"]) >= datetime.now(TZ)])
 
     text = (
         "👋 Bienvenue sur FICHES CLIENTS\n\n"
         f"Base active : {active_db}\n\n"
         "Statistiques du jour :\n"
         f"- Clients traités : {nb_contactes}\n"
-        f"- Appels manqués : {nb_appels_manques}\n"
-        f"- Dossiers en cours : {nb_dossiers_en_cours_jour}\n"
+        f"- Appels manqués : {nb_appels_manques_day}\n"
+        f"- Dossiers en cours : {nb_dossiers_en_cours_day}\n"
         f"- Fiches totales : {nb_fiches}\n\n"
         "Utilisez les boutons ci-dessous ou tapez /start pour revenir à l'accueil."
     )
@@ -936,6 +1092,45 @@ async def back_to_start(cb: CallbackQuery):
         [InlineKeyboardButton(text="🔎 Rechercher une fiche", callback_data="home:search")],
         [InlineKeyboardButton(text=f"✅ Clients traités ({treated_count})", callback_data="home:treated")],
         [InlineKeyboardButton(text=f"🗂️ Dossiers en cours ({inprogress_count})", callback_data="home:cases")],
-        [InlineKeyboardButton(text=f"📵 Appels manqués ({nb_appels_manques})", callback_data="home:missed")],
+        [InlineKeyboardButton(text=f"📵 Appels manqués ({missed_count})", callback_data="home:missed")],
+        [InlineKeyboardButton(text=f"📅 RDV programmés ({rdv_count})", callback_data="home:rdv")],
     ])
     await show_page(cb, text, kb, photo_url="https://i.postimg.cc/0jNN08J5/IMG-0294.jpg")
+
+# ----------------- Scheduler RDV (rappel -5 min) -----------------
+async def rdv_scheduler():
+    while True:
+        try:
+            now = datetime.now(TZ)
+            for user_id, bases in list(USER_RDV.items()):
+                for base, items in list(bases.items()):
+                    for it in items:
+                        if it.get("sent"):
+                            continue
+                        try:
+                            remind_at = datetime.fromisoformat(it["remind_iso"])
+                        except Exception:
+                            continue
+                        if now >= remind_at:
+                            rid = it["rid"]
+                            rec = find_record(base, rid)
+                            name = pretty_name(rec) if rec else f"Fiche {rid}"
+                            at = datetime.fromisoformat(it["at_iso"]).astimezone(TZ).strftime("%H:%M")
+                            try:
+                                await bot.send_message(
+                                    chat_id=it["chat_id"],
+                                    text=f"⏰ Rappel RDV à {at} avec {name}",
+                                    reply_markup=InlineKeyboardMarkup(
+                                        inline_keyboard=[[InlineKeyboardButton(text="Ouvrir la fiche", callback_data=f"rec:view:{base}:{rid}")]]
+                                    )
+                                )
+                            except Exception:
+                                pass
+                            it["sent"] = True
+            await asyncio.sleep(30)
+        except Exception:
+            await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(rdv_scheduler())

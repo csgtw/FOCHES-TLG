@@ -1,7 +1,9 @@
 # main.py — FastAPI + aiogram v3.x (compatible Render webhook)
 import os
 import re
-from typing import List, Dict, Optional
+import csv
+from io import StringIO
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, HTTPException
@@ -9,7 +11,7 @@ from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, Update,
-    CallbackQuery, Message
+    CallbackQuery, Message, FSInputFile
 )
 
 # ----------------- Configuration -----------------
@@ -44,8 +46,19 @@ async def telegram_webhook(request: Request):
 # -------------------------------------------------
 # Stockage en mémoire (à remplacer par PostgreSQL plus tard)
 # -------------------------------------------------
+# BASES[name] = {
+#   "records": int,
+#   "size_mb": float,
+#   "last_import": ISO str | None,
+#   "phone_count": int,
+#   "records_list": List[Dict],  # fiches
+#   "dept_counts": Dict[str,int] # ex: {"31": 120, "75": 98, "971": 14}
+# }
 BASES: Dict[str, Dict] = {
-    "default": {"records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0}
+    "default": {
+        "records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0,
+        "records_list": [], "dept_counts": {}
+    }
 }
 USER_PREFS: Dict[int, Dict] = {}
 USER_STATE: Dict[int, Dict] = {}
@@ -60,7 +73,7 @@ def get_active_db(user_id: int) -> str:
 def set_active_db(user_id: int, dbname: str) -> None:
     USER_PREFS.setdefault(user_id, {})["active_db"] = dbname
 
-# ----------------- Utilitaires parsing TXT -----------------
+# ----------------- Utilitaires parsing & stats -----------------
 def normalize_phone(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
@@ -70,6 +83,14 @@ def normalize_phone(s: Optional[str]) -> Optional[str]:
     if len(digits) == 9:
         digits = "0" + digits
     return digits or None
+
+def dept_from_cp(cp: Optional[str]) -> Optional[str]:
+    if not cp or not re.fullmatch(r"\d{5}", cp):
+        return None
+    # Outre-mer: 97x / 98x (ex: 971xx, 972xx, 973xx, 974xx, 976xx, 986/987/988/989 ont souvent 98x…)
+    if cp.startswith(("97", "98")):
+        return cp[:3]
+    return cp[:2]
 
 def parse_txt_block(block: str) -> Optional[Dict]:
     lines = [l.strip() for l in block.splitlines() if l.strip()]
@@ -163,12 +184,12 @@ def parse_txt_blocks(content: str) -> List[Dict]:
             results.append(rec)
     return results
 
-# ----------------- Affichage d'accueil factorisé -----------------
+# ----------------- Accueil factorisé & /start -----------------
 async def send_home(chat_id: int, user_id: int):
     active_db = get_active_db(user_id)
-    nb_contactes = 0
-    nb_appels_manques = 0
-    nb_dossiers_en_cours = 0
+    nb_contactes = 0          # à brancher plus tard
+    nb_appels_manques = 0     # à brancher plus tard
+    nb_dossiers_en_cours = 0  # à brancher plus tard
     nb_numeros = BASES.get(active_db, {}).get("phone_count", 0)
 
     text = (
@@ -193,7 +214,6 @@ async def send_home(chat_id: int, user_id: int):
     await bot.send_photo(chat_id=chat_id, photo=image_url, caption=text,
                          parse_mode="Markdown", reply_markup=kb)
 
-# ----------------- Accueil (/start) -----------------
 @router.message(CommandStart())
 async def accueil(message: types.Message):
     user_id = message.from_user.id
@@ -203,7 +223,7 @@ async def accueil(message: types.Message):
 dp.include_router(router)
 
 # ==========================================================
-# GÉRER LES BASES + IMPORT
+# GÉRER LES BASES + IMPORT + EXPORT + STATS PAR DÉPARTEMENT
 # ==========================================================
 def render_db_list_text(user_id: int) -> str:
     active = get_active_db(user_id)
@@ -221,14 +241,19 @@ def db_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
     active = get_active_db(user_id)
     rows = []
     for name in BASES.keys():
+        # bouton de sélection (active la base)
         rows.append([InlineKeyboardButton(text=f"{'●' if name == active else '○'} {name}",
                                           callback_data=f"db:use:{name}")])
-        rows.append([
+        # rangée d'actions
+        action_row = [
             InlineKeyboardButton(text="Stats", callback_data=f"db:stats:{name}"),
             InlineKeyboardButton(text="Importer", callback_data=f"db:import:{name}"),
             InlineKeyboardButton(text="Exporter", callback_data=f"db:export:{name}"),
-            InlineKeyboardButton(text="Supprimer", callback_data=f"db:drop:{name}")
-        ])
+        ]
+        # le bouton "Supprimer" n'apparait QUE pour la base active
+        if name == active:
+            action_row.append(InlineKeyboardButton(text="Supprimer", callback_data=f"db:drop:{name}"))
+        rows.append(action_row)
     rows.append([InlineKeyboardButton(text="Ajouter une base", callback_data="db:create")])
     rows.append([InlineKeyboardButton(text="Retour à l'accueil (/start)", callback_data="nav:start")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -274,7 +299,10 @@ async def db_use(cb: CallbackQuery):
     await edit_home_like(cb, text, kb)
     await cb.answer(f"Base active: {name}")
 
-# --- Stats d’une base ---
+# --- Stats d’une base (avec départements triés) ---
+def sorted_dept_counts(counts: Dict[str,int]) -> List[Tuple[str,int]]:
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
 @router.callback_query(F.data.startswith("db:stats:"))
 async def db_stats(cb: CallbackQuery):
     name = cb.data.split(":", 2)[2]
@@ -282,12 +310,24 @@ async def db_stats(cb: CallbackQuery):
     if not meta:
         await cb.answer("Base introuvable.", show_alert=True)
         return
+
+    depts = sorted_dept_counts(meta.get("dept_counts", {}))
+    # Construire un tableau texte simple
+    if depts:
+        dept_lines = ["Départements (triés) :", ""]
+        for code, n in depts:
+            dept_lines.append(f"- {code} : {n} fiche(s)")
+        dept_text = "\n".join(dept_lines)
+    else:
+        dept_text = "Aucun code postal détecté pour cette base."
+
     text = (
         f"Statistiques de la base: {name}\n\n"
         f"- Fiches: {meta['records']}\n"
         f"- Numéros: {meta.get('phone_count', 0)}\n"
         f"- Taille estimée: {meta['size_mb']} Mo\n"
         f"- Dernier import: {meta['last_import'] or '—'}\n\n"
+        f"{dept_text}\n\n"
         "Actions disponibles:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -327,7 +367,10 @@ async def capture_base_name(message: Message):
         await message.answer("Ce nom existe déjà. Choisissez-en un autre.")
         return
 
-    BASES[raw] = {"records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0}
+    BASES[raw] = {
+        "records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0,
+        "records_list": [], "dept_counts": {}
+    }
     USER_STATE[user_id]["awaiting_base_name"] = False
     set_active_db(user_id, raw)
 
@@ -335,13 +378,19 @@ async def capture_base_name(message: Message):
     kb = db_list_keyboard(user_id)
     await message.answer(text, reply_markup=kb)
 
-# --- Supprimer une base (confirmation) ---
+# --- Supprimer une base (affiché seulement pour la base active) ---
 @router.callback_query(F.data.startswith("db:drop:"))
 async def db_drop(cb: CallbackQuery):
+    user_id = cb.from_user.id
     name = cb.data.split(":", 2)[2]
     if name not in BASES:
         await cb.answer("Base introuvable.", show_alert=True)
         return
+    # vérif sécurité: on n'autorise la suppression que si c'est la base active de l'utilisateur
+    if get_active_db(user_id) != name:
+        await cb.answer("Sélectionne d'abord cette base pour la supprimer (elle doit être active).", show_alert=True)
+        return
+
     text = f"Confirmer la suppression de la base « {name} » ? Cette action est définitive."
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Supprimer définitivement", callback_data=f"db:dropconfirm:{name}")],
@@ -357,13 +406,16 @@ async def db_drop_confirm(cb: CallbackQuery):
     if name not in BASES:
         await cb.answer("Base introuvable.", show_alert=True)
         return
+    if get_active_db(user_id) != name:
+        await cb.answer("Sélectionne d'abord cette base pour la supprimer (elle doit être active).", show_alert=True)
+        return
     if len(BASES) == 1:
         await cb.answer("Impossible: il doit rester au moins une base.", show_alert=True)
         return
 
     del BASES[name]
-    if get_active_db(user_id) == name:
-        set_active_db(user_id, "default" if "default" in BASES else next(iter(BASES.keys())))
+    # fallback: bascule sur 'default' si possible, sinon n'importe laquelle
+    set_active_db(user_id, "default" if "default" in BASES else next(iter(BASES.keys())))
 
     text = render_db_list_text(user_id)
     kb = db_list_keyboard(user_id)
@@ -391,7 +443,7 @@ async def db_import_start(cb: CallbackQuery):
     await edit_home_like(cb, text, kb)
     await cb.answer()
 
-# --- Réception d'un document et import TXT ---
+# --- Réception d'un document et import TXT (stockage réel en mémoire) ---
 @router.message(F.document)
 async def handle_import_file(message: Message):
     user_id = message.from_user.id
@@ -420,20 +472,29 @@ async def handle_import_file(message: Message):
             with open(dst_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
             records = parse_txt_blocks(content)
-            added_records = len(records)
+
+            # Stockage réel en mémoire + maj compteurs
             for r in records:
+                # calcule, stocke le département
+                dept = dept_from_cp(r.get("cp"))
+                r["dept"] = dept
+                BASES[target]["records_list"].append(r)
+                added_records += 1
                 if r.get("mobile"):
                     added_phone_count += 1
                 if r.get("voip"):
                     added_phone_count += 1
+                if dept:
+                    BASES[target]["dept_counts"][dept] = BASES[target]["dept_counts"].get(dept, 0) + 1
+
         elif filename.endswith(".csv"):
-            # TODO: parser CSV réel
-            added_records = 0
-            added_phone_count = 0
+            # TODO: parser CSV réel (ajouter dans records_list, phone_count, dept_counts)
+            pass
+
         elif filename.endswith(".jsonl") or filename.endswith(".json"):
             # TODO: parser JSON/JSONL réel
-            added_records = 0
-            added_phone_count = 0
+            pass
+
     except Exception as e:
         USER_STATE[user_id]["awaiting_import_for_base"] = None
         await message.answer(f"Erreur pendant l'import: {e}")
@@ -459,21 +520,34 @@ async def handle_import_file(message: Message):
     kb = db_list_keyboard(user_id)
     await message.answer(text, reply_markup=kb)
 
-# --- Export (stub) ---
+# --- Export (réel): génère un CSV depuis records_list et l'envoie ---
 @router.callback_query(F.data.startswith("db:export:"))
 async def db_export(cb: CallbackQuery):
     name = cb.data.split(":", 2)[2]
-    if name not in BASES:
+    meta = BASES.get(name)
+    if not meta:
         await cb.answer("Base introuvable.", show_alert=True)
         return
-    text = (
-        f"Export de la base « {name} » en préparation...\n"
-        "Cette version de test prépare l’export. L’export réel sera branché ensuite."
+
+    # Génération CSV en mémoire
+    headers = ["last_name", "first_name", "full_name_raw", "email", "mobile", "voip",
+               "ville", "cp", "dept", "adresse", "iban", "bic", "dob", "statut"]
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for rec in meta.get("records_list", []):
+        writer.writerow(rec)
+    csv_data = buf.getvalue().encode("utf-8")
+
+    # Écriture dans /tmp et envoi
+    tmp_path = f"/tmp/export_{name}_{int(datetime.now().timestamp())}.csv"
+    with open(tmp_path, "wb") as f:
+        f.write(csv_data)
+
+    await cb.message.answer_document(
+        document=FSInputFile(tmp_path, filename=f"{name}.csv"),
+        caption=f"Export CSV de la base « {name} » ({len(meta.get('records_list', []))} fiches)."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Retour aux bases", callback_data="home:db")]
-    ])
-    await edit_home_like(cb, text, kb)
     await cb.answer()
 
 # --- Retour à l'accueil via bouton ---

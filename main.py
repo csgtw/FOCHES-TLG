@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from io import StringIO
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta, date, time
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, HTTPException
@@ -79,6 +79,9 @@ USER_RDV: Dict[int, Dict[str, List[Dict]]] = {}
 CALLERS: Dict[int, List[Dict]] = {}  # per-user list of {"id","name","active":bool}
 REC_ASSIGN: Dict[int, Dict[str, Dict[str, Dict]]] = {}  # per-user -> base -> rid -> {"caller_id","name","since_iso"}
 
+# Traités meta pour comptages du jour par calleur
+TREATED_META: Dict[int, Dict[str, Dict[str, Dict]]] = {}  # user -> base -> rid -> {"caller_id","at_iso"}
+
 def ensure_user(user_id: int) -> None:
     USER_PREFS.setdefault(user_id, {"active_db": "default"})
     USER_STATE.setdefault(user_id, {})
@@ -89,6 +92,7 @@ def ensure_user(user_id: int) -> None:
     USER_RDV.setdefault(user_id, {})
     CALLERS.setdefault(user_id, [])
     REC_ASSIGN.setdefault(user_id, {})
+    TREATED_META.setdefault(user_id, {})
 
 def get_active_db(user_id: int) -> str:
     return USER_PREFS.get(user_id, {}).get("active_db", "default")
@@ -100,9 +104,16 @@ def set_active_db(user_id: int, dbname: str) -> None:
     USER_INPROGRESS[user_id].setdefault(dbname, [])
     USER_RDV[user_id].setdefault(dbname, [])
     REC_ASSIGN[user_id].setdefault(dbname, {})
+    TREATED_META[user_id].setdefault(dbname, {})
 
 def today_str() -> str:
     return datetime.now(TZ).date().isoformat()
+
+def is_today_iso(dt_iso: str) -> bool:
+    try:
+        return datetime.fromisoformat(dt_iso).astimezone(TZ).date().isoformat() == today_str()
+    except Exception:
+        return False
 
 def get_today_stats(user_id: int) -> Dict[str, int]:
     ensure_user(user_id)
@@ -119,6 +130,31 @@ def inc_stat(user_id: int, key: str, delta: int = 1) -> None:
     stats[key] = stats.get(key, 0) + delta
 
 # ----------------- Utils -----------------
+async def send_ephemeral(chat_id: int, text: str, ttl_sec: int = 5):
+    """Envoie un message qui s'auto-supprime (on ne supprime jamais les fiches)."""
+    try:
+        m = await bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        return
+    async def _delete_later(mid: int):
+        await asyncio.sleep(ttl_sec)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+    asyncio.create_task(_delete_later(m.message_id))
+
+def msg_is_fiche(message: Message) -> bool:
+    txt = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    return isinstance(txt, str) and txt.startswith("Fiche")
+
+async def delete_if_not_fiche(message: Message):
+    try:
+        if not msg_is_fiche(message):
+            await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+    except Exception:
+        pass
+
 def normalize_phone(s: Optional[str]) -> Optional[str]:
     """0XXXXXXXXX (FR)."""
     if not s:
@@ -251,13 +287,7 @@ def ensure_record_ids(base_name: str):
 async def show_page(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup,
                     photo_url: Optional[str] = None, parse_mode: Optional[str] = None):
     await safe_cb_answer(cb)
-    # On garde les fiches (messages "Fiche …"), on supprime le reste
-    try:
-        msg_text = getattr(cb.message, "text", None) or getattr(cb.message, "caption", None) or ""
-        if not (isinstance(msg_text, str) and msg_text.strip().startswith("Fiche")):
-            await cb.message.delete()
-    except Exception:
-        pass
+    await delete_if_not_fiche(cb.message)
     if photo_url:
         await bot.send_photo(
             chat_id=cb.message.chat.id,
@@ -360,6 +390,20 @@ def find_record(base: str, rid: str) -> Optional[Dict]:
     return None
 
 # ----------------- Accueil -----------------
+def caller_counts(user_id: int, base: str, cid: str) -> Tuple[int, int]:
+    """retourne (en_cours_aujourd'hui, traites_aujourd'hui) pour un calleur"""
+    assign = REC_ASSIGN.get(user_id, {}).get(base, {})
+    ongoing_today = 0
+    for rid, meta in assign.items():
+        if meta.get("caller_id") == cid and is_today_iso(meta.get("since_iso", "")):
+            ongoing_today += 1
+    treated_meta = TREATED_META.get(user_id, {}).get(base, {})
+    treated_today = 0
+    for rid, meta in treated_meta.items():
+        if meta.get("caller_id") == cid and is_today_iso(meta.get("at_iso", "")):
+            treated_today += 1
+    return ongoing_today, treated_today
+
 def caller_counts_for_home(user_id: int, base: str) -> int:
     return len([c for c in CALLERS.get(user_id, []) if c.get("active", True)])
 
@@ -378,7 +422,6 @@ async def send_home(chat_id: int, user_id: int):
     callers_count = caller_counts_for_home(user_id, active_db)
 
     text = (
-        "👋 Bienvenue sur FICHES CLIENTS\n\n"
         f"Base active : {active_db}\n\n"
         "Statistiques du jour :\n"
         f"- Clients traités : {nb_contactes}\n"
@@ -433,7 +476,7 @@ async def find_and_reply_number(message: Message, raw_number: str):
 
     num = normalize_phone(raw_number.strip())
     if not num or not re.fullmatch(r"0\d{9}", num):
-        await message.answer("Numéro invalide. Exemple attendu : 06123456789")
+        await send_ephemeral(message.chat.id, "Numéro invalide. Exemple attendu : 06123456789")
         return
 
     base = BASES.get(active, {})
@@ -442,7 +485,7 @@ async def find_and_reply_number(message: Message, raw_number: str):
     matches = [r for r in records if r.get("mobile") == num or r.get("voip") == num]
 
     if not matches:
-        await message.answer(f"Aucune fiche trouvée pour le numéro {num}.")
+        await send_ephemeral(message.chat.id, f"Aucune fiche trouvée pour le numéro {num}.")
         return
 
     if len(matches) == 1:
@@ -460,13 +503,13 @@ async def find_and_reply_number(message: Message, raw_number: str):
     if len(matches) > 10:
         lines.append("…")
 
-    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await bot.send_message(message.chat.id, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @router.message(Command("num"))
 async def search_by_number_cmd(message: Message):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Utilisation : /num 06123456789")
+        await send_ephemeral(message.chat.id, "Utilisation : /num 06123456789")
         return
     await find_and_reply_number(message, parts[1])
 
@@ -532,7 +575,6 @@ async def db_open(cb: CallbackQuery):
 # ----------------- Saisies texte : nom / recherche / note / rdv / calleur -----------------
 def parse_time_fr(s: str) -> Optional[Tuple[int, int]]:
     s = (s or "").strip().lower().replace(" ", "")
-    # 16h30 | 16:30 | 1630 | 16h
     m = re.match(r"^(\d{1,2})h?[:]?(\d{2})?$", s)
     if not m:
         return None
@@ -542,20 +584,26 @@ def parse_time_fr(s: str) -> Optional[Tuple[int, int]]:
         return None
     return hh, mm
 
+async def send_callers_menu_message(chat_id: int, user_id: int):
+    text = render_callers_text(user_id)
+    kb = callers_keyboard(user_id)
+    await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+
 @router.message(F.text)
 async def capture_text(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
 
-    # ---- Ajouter / renommer un calleur (on réutilise le même flag)
+    # ---- Ajouter / renommer un calleur (flag commun)
     if USER_STATE[user_id].get("awaiting_caller_name"):
         raw = (message.text or "").strip()
         USER_STATE[user_id]["awaiting_caller_name"] = False
         if not raw or len(raw) > 40:
-            await message.answer("Nom invalide (1–40 caractères).")
+            await send_ephemeral(message.chat.id, "Nom invalide (1–40 caractères).")
             return
         CALLERS[user_id].append({"id": uuid.uuid4().hex[:8], "name": raw, "active": True})
-        await message.answer(f"👤 Calleur « {raw} » ajouté.")
+        await send_ephemeral(message.chat.id, f"👤 Calleur « {raw} » ajouté.")
+        await send_callers_menu_message(message.chat.id, user_id)
         return
 
     # ---- Note en attente
@@ -566,7 +614,7 @@ async def capture_text(message: Message):
         rec = find_record(base, rid)
         USER_STATE[user_id]["awaiting_note_for"] = None
         if not rec:
-            await message.answer("Fiche introuvable pour ajouter la note.")
+            await send_ephemeral(message.chat.id, "Fiche introuvable pour ajouter la note.")
             return
         rec.setdefault("notes", []).append(message.text.strip())
         try:
@@ -578,10 +626,10 @@ async def capture_text(message: Message):
             )
         except Exception:
             await send_record_card(message.chat.id, user_id, base, rec)
-        await message.answer("✅ Note ajoutée.")
+        await send_ephemeral(message.chat.id, "✅ Note ajoutée.")
         return
 
-    # ---- RDV heure (voie texte — conservée)
+    # ---- RDV via texte
     rdv_target = USER_STATE[user_id].get("awaiting_rdv_for")
     if rdv_target:
         base = rdv_target["base"]; rid = rdv_target["rid"]
@@ -589,7 +637,7 @@ async def capture_text(message: Message):
         USER_STATE[user_id]["awaiting_rdv_for"] = None
         hm = parse_time_fr(message.text or "")
         if not hm:
-            await message.answer("Heure invalide. Exemples : 16h30, 16:30, 1630, 16h")
+            await send_ephemeral(message.chat.id, "Heure invalide. Exemples : 16h30, 16:30, 1630, 16h")
             return
         h, m = hm
         now = datetime.now(TZ)
@@ -614,17 +662,17 @@ async def capture_text(message: Message):
                 )
             except Exception:
                 await send_record_card(message.chat.id, user_id, base, rec)
-        await message.answer(f"📅 RDV placé pour {format_dt_short(at)} (rappel 5 min avant).")
+        await send_ephemeral(message.chat.id, f"📅 RDV placé pour {format_dt_short(at)} (rappel 5 min avant).")
         return
 
     # ---- Création base : on attend un nom
     if USER_STATE[user_id].get("awaiting_base_name"):
         raw = (message.text or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_]{1,40}", raw):
-            await message.answer("Nom invalide. Autorisés: A–Z, a–z, 0–9, _. Max 40.")
+            await send_ephemeral(message.chat.id, "Nom invalide. Autorisés: A–Z, a–z, 0–9, _. Max 40.")
             return
         if raw in BASES:
-            await message.answer("Ce nom existe déjà. Choisissez-en un autre.")
+            await send_ephemeral(message.chat.id, "Ce nom existe déjà. Choisissez-en un autre.")
             return
 
         BASES[raw] = {
@@ -645,7 +693,7 @@ async def capture_text(message: Message):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Retour", callback_data="home:db")]
         ])
-        await message.answer(text, reply_markup=kb)
+        await bot.send_message(message.chat.id, text, reply_markup=kb)
         return
 
     # ---- Recherche par numéro
@@ -731,7 +779,7 @@ async def handle_import_file(message: Message):
     allowed = (filename.endswith(".csv") or filename.endswith(".json")
                or filename.endswith(".jsonl") or filename.endswith(".txt"))
     if not allowed:
-        await message.answer("Format non pris en charge. Envoie .csv, .json, .jsonl ou .txt.")
+        await send_ephemeral(message.chat.id, "Format non pris en charge. Envoie .csv, .json, .jsonl ou .txt.")
         return
 
     tg_file = await bot.get_file(message.document.file_id)
@@ -770,7 +818,7 @@ async def handle_import_file(message: Message):
 
     except Exception as e:
         USER_STATE[user_id]["awaiting_import_for_base"] = None
-        await message.answer(f"Erreur pendant l'import: {e}")
+        await send_ephemeral(message.chat.id, f"Erreur pendant l'import: {e}")
         return
 
     BASES[target]["records"] += added_records
@@ -779,7 +827,8 @@ async def handle_import_file(message: Message):
     BASES[target]["last_import"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     USER_STATE[user_id]["awaiting_import_for_base"] = None
 
-    await message.answer(
+    await bot.send_message(
+        message.chat.id,
         f"Import terminé dans « {target} ».\n"
         f"- Fiches ajoutées: {added_records}\n"
         f"- Taille du fichier: {size_mb} Mo\n"
@@ -788,7 +837,7 @@ async def handle_import_file(message: Message):
 
     text = f"Base sélectionnée : {target}\n\nChoisissez une action."
     kb = base_menu_keyboard(target)
-    await message.answer(text, reply_markup=kb)
+    await bot.send_message(message.chat.id, text, reply_markup=kb)
 
 # ----------------- Export CSV -----------------
 @router.callback_query(F.data.startswith("db:export:"))
@@ -913,11 +962,12 @@ async def rec_ask(cb: CallbackQuery):
         return await safe_cb_answer(cb, "Envoie maintenant le texte de la note.")
 
     if action == "rdv":
-        # étape 1 : date (14 jours)
-        today = datetime.now(TZ).date()
-        choices = [today + timedelta(days=i) for i in range(0, 14)]
+        # 7 prochains jours (fr)
+        wd_fr = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+        start = datetime.now(TZ).date()
+        choices = [start + timedelta(days=i) for i in range(0, 7)]
         rows = [[InlineKeyboardButton(
-            text=d.strftime("%a %d/%m"),
+            text=f"{wd_fr[d.weekday()]} {d.strftime('%d/%m')}",
             callback_data=f"rec:rdv_date:{base}:{rid}:{d.isoformat()}"
         )] for d in choices]
         rows.append([InlineKeyboardButton(text="Retour fiche", callback_data=f"rec:view:{base}:{rid}")])
@@ -937,7 +987,7 @@ async def rec_ask(cb: CallbackQuery):
         return await show_page(cb, "Sélectionne le RDV à annuler :", InlineKeyboardMarkup(inline_keyboard=rows))
 
     if action == "ongoing":
-        # Sélection directe du calleur -> passage immédiat en 'en ligne'
+        # Sélection du calleur (pas de confirmation), supprimer l'écran après choix
         callers = [c for c in CALLERS.get(user_id, []) if c.get("active", True)]
         if not callers:
             rows = [
@@ -946,7 +996,7 @@ async def rec_ask(cb: CallbackQuery):
             ]
             return await show_page(cb, "Aucun calleur actif. Ajoute-en au moins un.", InlineKeyboardMarkup(inline_keyboard=rows))
         rows = []
-        for c in callers[:25]:
+        for c in callers[:50]:
             rows.append([InlineKeyboardButton(
                 text=f"👤 {c['name']}",
                 callback_data=f"rec:do:ongoing:{base}:{rid}:{c['id']}"
@@ -954,9 +1004,32 @@ async def rec_ask(cb: CallbackQuery):
         rows.append([InlineKeyboardButton(text="Retour fiche", callback_data=f"rec:view:{base}:{rid}")])
         return await show_page(cb, "Qui prend l’appel ?", InlineKeyboardMarkup(inline_keyboard=rows))
 
-    if action in ("finish", "missed"):
-        # action directe (pas de confirmation supplémentaire souhaitée)
-        return await rec_do(cb=cb.replace(data=f"rec:do:{action}:{base}:{rid}"))
+    if action == "finish":
+        # appliquer directement ici (bug corrigé: pas de cb.replace)
+        _exclusive_move(user_id, base, rid, "treated")
+        # enregistrer le calleur qui a pris l'appel si connu
+        assign = REC_ASSIGN[user_id].get(base, {}).pop(rid, None)
+        TREATED_META[user_id].setdefault(base, {})
+        TREATED_META[user_id][base][rid] = {
+            "caller_id": assign["caller_id"] if assign else None,
+            "at_iso": datetime.now(TZ).isoformat()
+        }
+        await delete_if_not_fiche(cb.message)
+        await safe_cb_answer(cb, "🟢 Fin d’appel — classé en 'traités'.")
+        rec2 = find_record(base, rid)
+        if rec2:
+            await send_record_card(cb.message.chat.id, user_id, base, rec2)
+        return
+
+    if action == "missed":
+        _exclusive_move(user_id, base, rid, "missed")
+        REC_ASSIGN[user_id].get(base, {}).pop(rid, None)
+        await delete_if_not_fiche(cb.message)
+        await safe_cb_answer(cb, "📵 Marqué « À rappeler ».")
+        rec2 = find_record(base, rid)
+        if rec2:
+            await send_record_card(cb.message.chat.id, user_id, base, rec2)
+        return
 
 @router.callback_query(F.data.startswith("rec:do:"))
 async def rec_do(cb: CallbackQuery):
@@ -985,19 +1058,8 @@ async def rec_do(cb: CallbackQuery):
             "name": c["name"],
             "since_iso": datetime.now(TZ).isoformat()
         }
+        await delete_if_not_fiche(cb.message)  # supprime l'écran "Qui prend l'appel ?"
         await safe_cb_answer(cb, f"📞 En ligne — {c['name']}")
-        return await send_record_card(cb.message.chat.id, user_id, base, rec)
-
-    if action == "finish":
-        _exclusive_move(user_id, base, rid, "treated")
-        REC_ASSIGN[user_id].setdefault(base, {}).pop(rid, None)
-        await safe_cb_answer(cb, "🟢 Fin d’appel — classé en 'traités'.")
-        return await send_record_card(cb.message.chat.id, user_id, base, rec)
-
-    if action == "missed":
-        _exclusive_move(user_id, base, rid, "missed")
-        REC_ASSIGN[user_id].setdefault(base, {}).pop(rid, None)
-        await safe_cb_answer(cb, "📵 Marqué « À rappeler ».")
         return await send_record_card(cb.message.chat.id, user_id, base, rec)
 
 # ----------------- RDV (date -> time) + annulation confirm -----------------
@@ -1047,6 +1109,19 @@ def _cancel_rdv_by_id(user_id: int, base: str, rdv_id: str) -> Tuple[bool, Optio
             _refresh_record_next_rdv(user_id, base, target_rid)
     return cancelled, target_rid
 
+def french_weekday(d: date) -> str:
+    return ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"][d.weekday()]
+
+def round_up_to_next_halfhour(dt: datetime) -> datetime:
+    minute = 30 if dt.minute < 30 else 0
+    hour = dt.hour if dt.minute < 30 else (dt.hour + 1) % 24
+    day_add = 1 if (dt.minute >= 30 and dt.hour == 23) else 0
+    base = dt.replace(second=0, microsecond=0)
+    base = base.replace(hour=hour, minute=minute)
+    if day_add:
+        base = base + timedelta(days=1)
+    return base
+
 @router.callback_query(F.data.startswith("rec:rdv_date:"))
 async def rec_rdv_date(cb: CallbackQuery):
     # rec:rdv_date:<base>:<rid>:YYYY-MM-DD
@@ -1055,16 +1130,38 @@ async def rec_rdv_date(cb: CallbackQuery):
         d = date.fromisoformat(ds)
     except Exception:
         return await safe_cb_answer(cb)
+
+    now = datetime.now(TZ)
+    # Génère des créneaux de 30 min sur 24h, en commençant au prochain créneau pour aujourd’hui
+    slots = []
+    start_dt = datetime.combine(d, time(0, 0), tzinfo=TZ)
+    if d == now.date():
+        start_dt = round_up_to_next_halfhour(now)
+        if start_dt.date() != d:
+            # si on a basculé au jour suivant, alors plus de créneau pour aujourd’hui
+            slots = []
+        else:
+            pass
+    end_dt = datetime.combine(d, time(23, 30), tzinfo=TZ)
+    cur = start_dt
+    while cur <= end_dt:
+        slots.append(cur)
+        cur = cur + timedelta(minutes=30)
+
+    if not slots:
+        rows = [[InlineKeyboardButton(text="Aucun créneau restant aujourd’hui", callback_data=f"rec:ask:rdv:{base}:{rid}")]]
+        rows.append([InlineKeyboardButton(text="Retour dates", callback_data=f"rec:ask:rdv:{base}:{rid}")])
+        return await show_page(cb, f"Aucun créneau pour le {d.strftime('%d/%m')} (journée écoulée).", InlineKeyboardMarkup(inline_keyboard=rows))
+
     rows = []
-    for h in range(8, 20):
-        for m in (0, 30):
-            hhmm = f"{h:02d}{m:02d}"
-            rows.append([InlineKeyboardButton(
-                text=f"{h:02d}:{m:02d}",
-                callback_data=f"rec:rdv_time:{base}:{rid}:{ds}:{hhmm}"
-            )])
+    for s in slots:
+        hhmm = s.strftime("%H%M")
+        rows.append([InlineKeyboardButton(
+            text=s.strftime("%H:%M"),
+            callback_data=f"rec:rdv_time:{base}:{rid}:{ds}:{hhmm}"
+        )])
     rows.append([InlineKeyboardButton(text="Retour dates", callback_data=f"rec:ask:rdv:{base}:{rid}")])
-    await show_page(cb, f"Choisis une heure pour le {d.strftime('%d/%m')} :", InlineKeyboardMarkup(inline_keyboard=rows))
+    await show_page(cb, f"Choisis une heure pour le {french_weekday(d)} {d.strftime('%d/%m')} :", InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith("rec:rdv_time:"))
 async def rec_rdv_time(cb: CallbackQuery):
@@ -1079,7 +1176,7 @@ async def rec_rdv_time(cb: CallbackQuery):
         [InlineKeyboardButton(text="Retour heures", callback_data=f"rec:rdv_date:{base}:{rid}:{ds}")],
         [InlineKeyboardButton(text="Retour fiche", callback_data=f"rec:view:{base}:{rid}")]
     ]
-    await show_page(cb, f"Confirmer RDV le {d.strftime('%d/%m')} à {h:02d}:{m:02d} ?", InlineKeyboardMarkup(inline_keyboard=rows))
+    await show_page(cb, f"Confirmer RDV le {french_weekday(d)} {d.strftime('%d/%m')} à {h:02d}:{m:02d} ?", InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith("rec:rdv_create:"))
 async def rec_rdv_create(cb: CallbackQuery):
@@ -1106,6 +1203,7 @@ async def rec_rdv_create(cb: CallbackQuery):
         "sent": False, "chat_id": cb.message.chat.id
     })
     rec["next_rdv_iso"] = at.isoformat()
+    await delete_if_not_fiche(cb.message)
     await safe_cb_answer(cb, f"📅 RDV placé pour {format_dt_short(at)} (rappel 5 min avant).")
     await send_record_card(cb.message.chat.id, user_id, base, rec)
 
@@ -1131,6 +1229,7 @@ async def rdv_do_cancel(cb: CallbackQuery):
         return await safe_cb_answer(cb)
     user_id = cb.from_user.id
     ok, _ = _cancel_rdv_by_id(user_id, base, rdv_id)
+    await delete_if_not_fiche(cb.message)
     await safe_cb_answer(cb, "🗑️ RDV annulé." if ok else "RDV introuvable ou déjà passé.")
     rec = find_record(base, rid)
     if rec:
@@ -1164,21 +1263,25 @@ def render_callers_text(user_id: int) -> str:
     if not lst:
         return "👥 Calleurs\n\nAucun calleur enregistré."
     lines = ["👥 Calleurs enregistrés :", ""]
+    base = get_active_db(user_id)
     for c in lst:
         badge = "🟢" if c.get("active", True) else "⚪️"
-        lines.append(f"- {badge} {c['name']} (id:{c['id']})")
+        on_today, tr_today = caller_counts(user_id, base, c["id"])
+        lines.append(f"- {badge} {c['name']} — {on_today} en ligne • {tr_today} traités aujourd’hui (id:{c['id']})")
     return "\n".join(lines)
 
 def callers_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    base = get_active_db(user_id)
     rows = []
     for c in CALLERS.get(user_id, [])[:50]:
+        on_today, tr_today = caller_counts(user_id, base, c["id"])
+        rows.append([
+            InlineKeyboardButton(text=f"👀 Fiches ({on_today} en ligne • {tr_today} traités ajd)", callback_data=f"home:callers:view:{c['id']}"),
+            InlineKeyboardButton(text="📝 Renommer", callback_data=f"home:callers:rename:{c['id']}"),
+        ])
         toggle_label = "Désactiver" if c.get("active", True) else "Activer"
         rows.append([
-            InlineKeyboardButton(text="👀 Voir ses fiches", callback_data=f"home:callers:view:{c['id']}"),
-            InlineKeyboardButton(text="📝 Renommer", callback_data=f"home:callers:rename:{c['id']}"),
             InlineKeyboardButton(text=toggle_label, callback_data=f"home:callers:toggle:{c['id']}"),
-        ])
-        rows.append([
             InlineKeyboardButton(text="🗑️ Supprimer", callback_data=f"home:callers:delask:{c['id']}")
         ])
     rows.append([InlineKeyboardButton(text="➕ Ajouter un calleur", callback_data="home:callers:add")])
@@ -1245,48 +1348,61 @@ async def home_callers_rename(cb: CallbackQuery):
     old = next((c for c in CALLERS[user_id] if c["id"] == cid), None)
     if not old:
         return await safe_cb_answer(cb, "Introuvable.")
-    # on supprime l'ancien puis on demande un nouveau nom (simple)
+    # supprime l'ancien puis demande un nouveau nom
     CALLERS[user_id] = [c for c in CALLERS[user_id] if c["id"] != cid]
     USER_STATE[user_id]["awaiting_caller_name"] = True
     text = f"Renommage — envoie le nouveau nom pour « {old['name']} » (ancien supprimé, nouveau créé)."
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Annuler", callback_data="home:callers")]])
     await show_page(cb, text, kb)
 
-# ---- Vue des fiches d’un calleur ----
-def rec_ids_for_caller(user_id: int, base: str, caller_id: str, bucket: str) -> List[str]:
-    if bucket == "ongoing":
-        ids = USER_INPROGRESS.get(user_id, {}).get(base, [])
-    elif bucket == "treated":
-        ids = USER_TREATED.get(user_id, {}).get(base, [])
-    else:
-        ids = []
+# ---- Vue directe des fiches d’un calleur (sans sous-dossiers) ----
+def rec_ids_for_caller_all(user_id: int, base: str, caller_id: str) -> Tuple[List[str], List[str]]:
+    """retourne (ongoing_all, treated_today)"""
+    ongoing_all = []
     assign = REC_ASSIGN.get(user_id, {}).get(base, {})
-    return [rid for rid in ids if assign.get(rid, {}).get("caller_id") == caller_id]
+    for rid, meta in assign.items():
+        if meta.get("caller_id") == caller_id:
+            ongoing_all.append(rid)
+    treated_today = []
+    for rid, meta in TREATED_META.get(user_id, {}).get(base, {}).items():
+        if meta.get("caller_id") == caller_id and is_today_iso(meta.get("at_iso", "")):
+            treated_today.append(rid)
+    return ongoing_all, treated_today
 
 @router.callback_query(F.data.startswith("home:callers:view:"))
 async def callers_view(cb: CallbackQuery):
-    # home:callers:view:<cid> -> choisir liste
+    # home:callers:view:<cid> -> afficher directement la liste mixte
     user_id = cb.from_user.id
+    base = get_active_db(user_id)
     cid = cb.data.split(":")[-1]
     c = next((x for x in CALLERS.get(user_id, []) if x["id"] == cid), None)
     if not c:
         return await safe_cb_answer(cb, "Calleur introuvable.")
-    rows = [
-        [InlineKeyboardButton(text="📞 En cours (en ligne)", callback_data=f"home:callers:viewlist:ongoing:{cid}")],
-        [InlineKeyboardButton(text="✅ Traités", callback_data=f"home:callers:viewlist:treated:{cid}")],
-        [InlineKeyboardButton(text="Retour", callback_data="home:callers")],
-    ]
-    await show_page(cb, f"Fiches de {c['name']} :", InlineKeyboardMarkup(inline_keyboard=rows))
+    ongoing, treated_today = rec_ids_for_caller_all(user_id, base, cid)
 
-@router.callback_query(F.data.startswith("home:callers:viewlist:"))
-async def callers_viewlist(cb: CallbackQuery):
-    # home:callers:viewlist:<bucket>:<cid>
-    user_id = cb.from_user.id
-    _, _, _, bucket, cid = cb.data.split(":")
-    base = get_active_db(user_id)
-    rec_ids = rec_ids_for_caller(user_id, base, cid, bucket)
-    title = "Dossiers en cours" if bucket == "ongoing" else "Clients traités"
-    await show_records_list(cb, f"{title} — calleur", rec_ids, base)
+    lines = [f"Fiches de {c['name']} :", ""]
+    rows = []
+    if ongoing:
+        lines.append("— En ligne :")
+        for rid in ongoing[:50]:
+            rec = find_record(base, rid)
+            if not rec: continue
+            label = f"{pretty_name(rec)} — {(rec.get('ville') or '—')} ({rec.get('cp') or '—'})"
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"rec:view:{base}:{rid}")])
+        lines.append("")
+    if treated_today:
+        lines.append("— Traités aujourd’hui :")
+        for rid in treated_today[:50]:
+            rec = find_record(base, rid)
+            if not rec: continue
+            label = f"{pretty_name(rec)} — {(rec.get('ville') or '—')} ({rec.get('cp') or '—'})"
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"rec:view:{base}:{rid}")])
+        lines.append("")
+    if not ongoing and not treated_today:
+        lines.append("Aucune fiche en ligne ou traitée aujourd’hui.")
+
+    rows.append([InlineKeyboardButton(text="Retour", callback_data="home:callers")])
+    await show_page(cb, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
 # ----------------- Voir Clients traités / Dossiers en cours / Appels manqués -----------------
 async def show_records_list(cb: CallbackQuery, title: str, rec_ids: List[str], base: str):
@@ -1356,7 +1472,6 @@ async def back_to_start(cb: CallbackQuery):
     callers_count = caller_counts_for_home(cb.from_user.id, active_db)
 
     text = (
-        "👋 Bienvenue sur FICHES CLIENTS\n\n"
         f"Base active : {active_db}\n\n"
         "Statistiques du jour :\n"
         f"- Clients traités : {nb_contactes}\n"

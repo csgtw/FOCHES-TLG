@@ -49,10 +49,8 @@ async def telegram_webhook(request: Request):
 
 # ----------------- Mémoire (remplacer par DB plus tard) -----------------
 BASES: Dict[str, Dict] = {
-    "default": {
-        "records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0,
-        "records_list": [], "dept_counts": {}
-    }
+    "default": {"records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0,
+                "records_list": [], "dept_counts": {}}
 }
 USER_PREFS: Dict[int, Dict] = {}
 USER_STATE: Dict[int, Dict] = {}
@@ -77,7 +75,8 @@ USER_RDV: Dict[int, Dict[str, List[Dict]]] = {}
 
 # Calleurs
 CALLERS: Dict[int, List[Dict]] = {}  # per-user list of {"id","name","active":bool}
-REC_ASSIGN: Dict[int, Dict[str, Dict[str, Dict]]] = {}  # per-user -> base -> rid -> {"caller_id","name","since_iso"}
+REC_ASSIGN: Dict[int, Dict[str, Dict[str, Dict]]] = {}  # user -> base -> rid -> {"caller_id","name","since_iso"}
+REC_LAST_CALLER: Dict[int, Dict[str, Dict[str, Dict]]] = {}  # user -> base -> rid -> {"caller_id","name","last_iso"}
 
 # Traités meta pour comptages du jour par calleur
 TREATED_META: Dict[int, Dict[str, Dict[str, Dict]]] = {}  # user -> base -> rid -> {"caller_id","at_iso"}
@@ -92,6 +91,7 @@ def ensure_user(user_id: int) -> None:
     USER_RDV.setdefault(user_id, {})
     CALLERS.setdefault(user_id, [])
     REC_ASSIGN.setdefault(user_id, {})
+    REC_LAST_CALLER.setdefault(user_id, {})
     TREATED_META.setdefault(user_id, {})
 
 def get_active_db(user_id: int) -> str:
@@ -104,6 +104,7 @@ def set_active_db(user_id: int, dbname: str) -> None:
     USER_INPROGRESS[user_id].setdefault(dbname, [])
     USER_RDV[user_id].setdefault(dbname, [])
     REC_ASSIGN[user_id].setdefault(dbname, {})
+    REC_LAST_CALLER[user_id].setdefault(dbname, {})
     TREATED_META[user_id].setdefault(dbname, {})
 
 def today_str() -> str:
@@ -130,20 +131,6 @@ def inc_stat(user_id: int, key: str, delta: int = 1) -> None:
     stats[key] = stats.get(key, 0) + delta
 
 # ----------------- Utils -----------------
-async def send_ephemeral(chat_id: int, text: str, ttl_sec: int = 5):
-    """Envoie un message qui s'auto-supprime (on ne supprime jamais les fiches)."""
-    try:
-        m = await bot.send_message(chat_id=chat_id, text=text)
-    except Exception:
-        return
-    async def _delete_later(mid: int):
-        await asyncio.sleep(ttl_sec)
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=mid)
-        except Exception:
-            pass
-    asyncio.create_task(_delete_later(m.message_id))
-
 def msg_is_fiche(message: Message) -> bool:
     txt = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
     return isinstance(txt, str) and txt.startswith("Fiche")
@@ -156,7 +143,6 @@ async def delete_if_not_fiche(message: Message):
         pass
 
 def normalize_phone(s: Optional[str]) -> Optional[str]:
-    """0XXXXXXXXX (FR)."""
     if not s:
         return None
     s = s.strip()
@@ -181,17 +167,14 @@ def parse_txt_block(block: str) -> Optional[Dict]:
     lines = [l.strip() for l in block.splitlines() if l.strip()]
     if not lines:
         return None
-
     data = {
         "rid": None,
         "iban": None, "bic": None, "full_name_raw": None,
         "first_name": None, "last_name": None, "dob": None,
         "email": None, "statut": None, "adresse": None,
         "ville": None, "cp": None, "mobile": None, "voip": None,
-        "notes": [],
-        "next_rdv_iso": None
+        "notes": [], "next_rdv_iso": None
     }
-
     re_kv = re.compile(r"^\s*([A-Za-zÉÈÊËÀÂÄÔÖÎÏÛÜÇéèêëàâäôöîïûüç\s/.-]+)\s*:\s*(.+?)\s*$")
     re_iban = re.compile(r"^[A-Z]{2}\d{2}[A-Z0-9]{11,}$")
     re_cp = re.compile(r".*?\((\d{5})\)\s*$")
@@ -203,13 +186,11 @@ def parse_txt_block(block: str) -> Optional[Dict]:
             m = re_kv.match(line)
             if m:
                 v = m.group(2).strip().replace(" ", "")
-                if re_iban.match(v):
-                    data["iban"] = v
+                if re_iban.match(v): data["iban"] = v
             i += 1; continue
         if line.upper().startswith("BIC"):
             m = re_kv.match(line)
-            if m:
-                data["bic"] = m.group(2).strip()
+            if m: data["bic"] = m.group(2).strip()
             i += 1; continue
         if ":" not in line:
             data["full_name_raw"] = line
@@ -227,16 +208,11 @@ def parse_txt_block(block: str) -> Optional[Dict]:
         if m:
             key = m.group(1).strip().lower()
             val = m.group(2).strip()
-            if val and val.upper() == "N/A":
-                val = None
-            if key.startswith("dob") or "naiss" in key:
-                data["dob"] = val
-            elif key.startswith("email"):
-                data["email"] = val
-            elif key.startswith("statut"):
-                data["statut"] = val
-            elif key.startswith("adresse"):
-                data["adresse"] = val
+            if val and val.upper() == "N/A": val = None
+            if key.startswith("dob") or "naiss" in key: data["dob"] = val
+            elif key.startswith("email"): data["email"] = val
+            elif key.startswith("statut"): data["statut"] = val
+            elif key.startswith("adresse"): data["adresse"] = val
             elif key.startswith("ville"):
                 mcp = re_cp.match(val or "")
                 if mcp:
@@ -244,16 +220,12 @@ def parse_txt_block(block: str) -> Optional[Dict]:
                     data["ville"] = (val or "")[: (val or "").rfind("(")].strip()
                 else:
                     data["ville"] = val
-            elif key.startswith("mobile"):
-                data["mobile"] = normalize_phone(val)
-            elif key.startswith("voip"):
-                data["voip"] = normalize_phone(val)
+            elif key.startswith("mobile"): data["mobile"] = normalize_phone(val)
+            elif key.startswith("voip"): data["voip"] = normalize_phone(val)
             elif key.startswith("iban") and not data["iban"]:
                 v = (val or "").replace(" ", "")
-                if re_iban.match(v):
-                    data["iban"] = v
-            elif key.startswith("bic") and not data["bic"]:
-                data["bic"] = val
+                if re_iban.match(v): data["iban"] = v
+            elif key.startswith("bic") and not data["bic"]: data["bic"] = val
         i += 1
 
     if not any([data["mobile"], data["voip"], data["email"], data["full_name_raw"], data["iban"]]):
@@ -265,8 +237,7 @@ def parse_txt_blocks(content: str) -> List[Dict]:
     results = []
     for b in blocks:
         rec = parse_txt_block(b)
-        if rec:
-            results.append(rec)
+        if rec: results.append(rec)
     return results
 
 # ----------------- Helpers callback & IDs -----------------
@@ -283,26 +254,15 @@ def ensure_record_ids(base_name: str):
         if not r.get("rid"):
             r["rid"] = str(idx)
 
-# Une seule page à la fois (navigation)
 async def show_page(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup,
                     photo_url: Optional[str] = None, parse_mode: Optional[str] = None):
     await safe_cb_answer(cb)
+    # on ne supprime pas les fiches ; on peut enlever la page précédente si ce n'est pas une fiche
     await delete_if_not_fiche(cb.message)
     if photo_url:
-        await bot.send_photo(
-            chat_id=cb.message.chat.id,
-            photo=photo_url,
-            caption=text,
-            reply_markup=kb,
-            parse_mode=parse_mode
-        )
+        await bot.send_photo(cb.message.chat.id, photo=photo_url, caption=text, reply_markup=kb, parse_mode=parse_mode)
     else:
-        await bot.send_message(
-            chat_id=cb.message.chat.id,
-            text=text,
-            reply_markup=kb,
-            parse_mode=parse_mode
-        )
+        await bot.send_message(cb.message.chat.id, text=text, reply_markup=kb, parse_mode=parse_mode)
 
 # ----------------- Rendu fiche + clavier -----------------
 def pretty_name(rec: Dict) -> str:
@@ -315,39 +275,48 @@ def format_dt_short(dt: datetime) -> str:
 
 def render_record_text(user_id: int, base: str, rec: Dict) -> str:
     name = pretty_name(rec)
+    iban = rec.get("iban") or "—"
+    bic = rec.get("bic") or "—"
+    adr = rec.get("adresse") or "—"
+    ville = rec.get("ville") or "—"
+    cp = rec.get("cp") or "—"
     mobile = rec.get("mobile") or "—"
     voip = rec.get("voip") or "—"
     email = rec.get("email") or "—"
-    ville = rec.get("ville") or "—"
-    cp = rec.get("cp") or "—"
-    adr = rec.get("adresse") or "—"
-    iban = rec.get("iban") or "—"
-    bic = rec.get("bic") or "—"
+
+    # caller display (online -> strong; else last caller)
+    assign = REC_ASSIGN.get(user_id, {}).get(base, {}).get(str(rec.get("rid")))
+    lastc = REC_LAST_CALLER.get(user_id, {}).get(base, {}).get(str(rec.get("rid")))
+    caller_line = ""
+    if assign:
+        try:
+            since = datetime.fromisoformat(assign["since_iso"]).astimezone(TZ).strftime("%H:%M")
+            caller_line = f"👤 CALLEUR (EN LIGNE) : {assign['name']} — depuis {since}"
+        except Exception:
+            caller_line = f"👤 CALLEUR (EN LIGNE) : {assign['name']}"
+    elif lastc:
+        caller_line = f"👤 Dernier calleur : {lastc['name']}"
+
+    rdv_line = ""
+    if rec.get("next_rdv_iso"):
+        try:
+            dt = datetime.fromisoformat(rec["next_rdv_iso"])
+            rdv_line = f"📅 RDV : {format_dt_short(dt)}"
+        except Exception:
+            pass
+
     notes_list = rec.get("notes") or []
     notes_block = ""
     if notes_list:
         lines = [f"- {n}" for n in notes_list[-10:]]
-        notes_block = "\n\nNotes :\n" + "\n".join(lines)
+        notes_block = "\nNotes :\n" + "\n".join(lines)
 
-    rdv_block = ""
-    if rec.get("next_rdv_iso"):
-        try:
-            dt = datetime.fromisoformat(rec["next_rdv_iso"])
-            rdv_block = f"\n- RDV : {format_dt_short(dt)}"
-        except Exception:
-            pass
+    header = "Fiche\n"
+    highlight = "\n".join([line for line in [caller_line, rdv_line] if line])
+    if highlight:
+        header += highlight + "\n" + "—" * 30 + "\n"
 
-    caller_block = ""
-    assign = REC_ASSIGN.get(user_id, {}).get(base, {}).get(str(rec.get("rid")))
-    if assign:
-        try:
-            since = datetime.fromisoformat(assign["since_iso"]).astimezone(TZ).strftime("%H:%M")
-            caller_block = f"\n- 👤 Calleur : {assign['name']} — depuis {since}"
-        except Exception:
-            caller_block = f"\n- 👤 Calleur : {assign['name']}"
-
-    return (
-        "Fiche\n"
+    body = (
         f"- Nom : {name}\n"
         f"- Mobile : {mobile}\n"
         f"- VoIP : {voip}\n"
@@ -356,10 +325,10 @@ def render_record_text(user_id: int, base: str, rec: Dict) -> str:
         f"- Ville : {ville} ({cp})\n"
         f"- IBAN : {iban}\n"
         f"- BIC : {bic}"
-        f"{caller_block}"
-        f"{rdv_block}"
-        f"{notes_block}"
     )
+    if notes_block:
+        body += "\n" + notes_block
+    return header + body
 
 def record_keyboard(user_id: int, base: str, rid: str, rec: Optional[Dict] = None) -> InlineKeyboardMarkup:
     rows = [
@@ -379,6 +348,18 @@ async def send_record_card(chat_id: int, user_id: int, base: str, rec: Dict):
     kb = record_keyboard(user_id, base, rec.get("rid", "0"), rec)
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
+async def refresh_record_view(cb: CallbackQuery, user_id: int, base: str, rec: Dict):
+    """Édite la fiche si possible, sinon envoie une nouvelle carte (évite les doublons)."""
+    text = render_record_text(user_id, base, rec)
+    kb = record_keyboard(user_id, base, rec.get("rid", "0"), rec)
+    try:
+        if msg_is_fiche(cb.message):
+            await bot.edit_message_text(chat_id=cb.message.chat.id, message_id=cb.message.message_id, text=text, reply_markup=kb)
+        else:
+            await send_record_card(cb.message.chat.id, user_id, base, rec)
+    except Exception:
+        await send_record_card(cb.message.chat.id, user_id, base, rec)
+
 def find_record(base: str, rid: str) -> Optional[Dict]:
     meta = BASES.get(base)
     if not meta:
@@ -391,7 +372,6 @@ def find_record(base: str, rid: str) -> Optional[Dict]:
 
 # ----------------- Accueil -----------------
 def caller_counts(user_id: int, base: str, cid: str) -> Tuple[int, int]:
-    """retourne (en_cours_aujourd'hui, traites_aujourd'hui) pour un calleur"""
     assign = REC_ASSIGN.get(user_id, {}).get(base, {})
     ongoing_today = 0
     for rid, meta in assign.items():
@@ -476,7 +456,7 @@ async def find_and_reply_number(message: Message, raw_number: str):
 
     num = normalize_phone(raw_number.strip())
     if not num or not re.fullmatch(r"0\d{9}", num):
-        await send_ephemeral(message.chat.id, "Numéro invalide. Exemple attendu : 06123456789")
+        await bot.send_message(message.chat.id, "Numéro invalide. Exemple attendu : 06123456789")
         return
 
     base = BASES.get(active, {})
@@ -485,7 +465,7 @@ async def find_and_reply_number(message: Message, raw_number: str):
     matches = [r for r in records if r.get("mobile") == num or r.get("voip") == num]
 
     if not matches:
-        await send_ephemeral(message.chat.id, f"Aucune fiche trouvée pour le numéro {num}.")
+        await bot.send_message(message.chat.id, f"Aucune fiche trouvée pour le numéro {num}.")
         return
 
     if len(matches) == 1:
@@ -509,7 +489,7 @@ async def find_and_reply_number(message: Message, raw_number: str):
 async def search_by_number_cmd(message: Message):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await send_ephemeral(message.chat.id, "Utilisation : /num 06123456789")
+        await bot.send_message(message.chat.id, "Utilisation : /num 06123456789")
         return
     await find_and_reply_number(message, parts[1])
 
@@ -584,60 +564,51 @@ def parse_time_fr(s: str) -> Optional[Tuple[int, int]]:
         return None
     return hh, mm
 
-async def send_callers_menu_message(chat_id: int, user_id: int):
-    text = render_callers_text(user_id)
-    kb = callers_keyboard(user_id)
-    await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-
 @router.message(F.text)
 async def capture_text(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
 
-    # ---- Ajouter / renommer un calleur (flag commun)
+    # ---- Ajouter / renommer un calleur
     if USER_STATE[user_id].get("awaiting_caller_name"):
         raw = (message.text or "").strip()
         USER_STATE[user_id]["awaiting_caller_name"] = False
         if not raw or len(raw) > 40:
-            await send_ephemeral(message.chat.id, "Nom invalide (1–40 caractères).")
+            await bot.send_message(message.chat.id, "Nom invalide (1–40 caractères).")
             return
         CALLERS[user_id].append({"id": uuid.uuid4().hex[:8], "name": raw, "active": True})
-        await send_ephemeral(message.chat.id, f"👤 Calleur « {raw} » ajouté.")
-        await send_callers_menu_message(message.chat.id, user_id)
+        # message persistant (ne s'auto-supprime pas)
+        await bot.send_message(message.chat.id, f"👤 Calleur « {raw} » ajouté.")
+        # revenir au menu des calleurs
+        text = render_callers_text(user_id)
+        kb = callers_keyboard(user_id)
+        await bot.send_message(message.chat.id, text, reply_markup=kb)
         return
 
     # ---- Note en attente
     note_target = USER_STATE[user_id].get("awaiting_note_for")
     if note_target:
         base = note_target["base"]; rid = note_target["rid"]
-        chat_id = note_target["chat_id"]; msg_id = note_target["message_id"]
-        rec = find_record(base, rid)
         USER_STATE[user_id]["awaiting_note_for"] = None
+        rec = find_record(base, rid)
         if not rec:
-            await send_ephemeral(message.chat.id, "Fiche introuvable pour ajouter la note.")
+            await bot.send_message(message.chat.id, "Fiche introuvable pour ajouter la note.")
             return
         rec.setdefault("notes", []).append(message.text.strip())
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=render_record_text(user_id, base, rec),
-                reply_markup=record_keyboard(user_id, base, rid, rec)
-            )
-        except Exception:
-            await send_record_card(message.chat.id, user_id, base, rec)
-        await send_ephemeral(message.chat.id, "✅ Note ajoutée.")
+        await bot.send_message(message.chat.id, "✅ Note ajoutée.")
+        # rafraîchir la fiche (si elle est ouverte)
+        fake_cb = types.CallbackQuery(message=types.Message(message_id=note_target["message_id"], chat=message.chat), id="0")
+        await refresh_record_view(fake_cb, user_id, base, rec)
         return
 
-    # ---- RDV via texte
+    # ---- RDV via texte (fallback)
     rdv_target = USER_STATE[user_id].get("awaiting_rdv_for")
     if rdv_target:
         base = rdv_target["base"]; rid = rdv_target["rid"]
-        chat_id = rdv_target["chat_id"]; msg_id = rdv_target["message_id"]
         USER_STATE[user_id]["awaiting_rdv_for"] = None
         hm = parse_time_fr(message.text or "")
         if not hm:
-            await send_ephemeral(message.chat.id, "Heure invalide. Exemples : 16h30, 16:30, 1630, 16h")
+            await bot.send_message(message.chat.id, "Heure invalide. Exemples : 16h30, 16:30, 1630, 16h")
             return
         h, m = hm
         now = datetime.now(TZ)
@@ -654,31 +625,24 @@ async def capture_text(message: Message):
         rec = find_record(base, rid)
         if rec:
             rec["next_rdv_iso"] = at.isoformat()
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg_id,
-                    text=render_record_text(user_id, base, rec),
-                    reply_markup=record_keyboard(user_id, base, rid, rec)
-                )
-            except Exception:
-                await send_record_card(message.chat.id, user_id, base, rec)
-        await send_ephemeral(message.chat.id, f"📅 RDV placé pour {format_dt_short(at)} (rappel 5 min avant).")
+            await bot.send_message(message.chat.id, f"📅 RDV placé pour {format_dt_short(at)} (rappel 5 min avant).")
+            # rafraîchir la fiche affichée si possible
+            fake_cb = types.CallbackQuery(message=types.Message(message_id=rdv_target["message_id"], chat=message.chat), id="0")
+            await refresh_record_view(fake_cb, user_id, base, rec)
         return
 
     # ---- Création base : on attend un nom
     if USER_STATE[user_id].get("awaiting_base_name"):
         raw = (message.text or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_]{1,40}", raw):
-            await send_ephemeral(message.chat.id, "Nom invalide. Autorisés: A–Z, a–z, 0–9, _. Max 40.")
+            await bot.send_message(message.chat.id, "Nom invalide. Autorisés: A–Z, a–z, 0–9, _. Max 40.")
             return
         if raw in BASES:
-            await send_ephemeral(message.chat.id, "Ce nom existe déjà. Choisissez-en un autre.")
+            await bot.send_message(message.chat.id, "Ce nom existe déjà. Choisissez-en un autre.")
             return
 
-        BASES[raw] = {
-            "records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0,
-            "records_list": [], "dept_counts": {}
-        }
+        BASES[raw] = {"records": 0, "size_mb": 0.0, "last_import": None, "phone_count": 0,
+                      "records_list": [], "dept_counts": {}}
         USER_STATE[user_id]["awaiting_base_name"] = False
         set_active_db(user_id, raw)
 
@@ -779,7 +743,7 @@ async def handle_import_file(message: Message):
     allowed = (filename.endswith(".csv") or filename.endswith(".json")
                or filename.endswith(".jsonl") or filename.endswith(".txt"))
     if not allowed:
-        await send_ephemeral(message.chat.id, "Format non pris en charge. Envoie .csv, .json, .jsonl ou .txt.")
+        await bot.send_message(message.chat.id, "Format non pris en charge. Envoie .csv, .json, .jsonl ou .txt.")
         return
 
     tg_file = await bot.get_file(message.document.file_id)
@@ -804,10 +768,8 @@ async def handle_import_file(message: Message):
                 r["rid"] = str(len(BASES[target]["records_list"]))
                 BASES[target]["records_list"].append(r)
                 added_records += 1
-                if r.get("mobile"):
-                    added_phone_count += 1
-                if r.get("voip"):
-                    added_phone_count += 1
+                if r.get("mobile"): added_phone_count += 1
+                if r.get("voip"): added_phone_count += 1
                 if dept:
                     BASES[target]["dept_counts"][dept] = BASES[target]["dept_counts"].get(dept, 0) + 1
 
@@ -818,7 +780,7 @@ async def handle_import_file(message: Message):
 
     except Exception as e:
         USER_STATE[user_id]["awaiting_import_for_base"] = None
-        await send_ephemeral(message.chat.id, f"Erreur pendant l'import: {e}")
+        await bot.send_message(message.chat.id, f"Erreur pendant l'import: {e}")
         return
 
     BASES[target]["records"] += added_records
@@ -911,34 +873,23 @@ async def db_drop_confirm(cb: CallbackQuery):
     await show_page(cb, text, kb)
 
 # ----------------- CONFIRMATIONS & ACTIONS FICHE -----------------
-
 def _exclusive_move(user_id: int, base: str, rid: str, target: str):
     """target in {'ongoing','treated','missed'}"""
-    lists = {
-        "ongoing": USER_INPROGRESS,
-        "treated": USER_TREATED,
-        "missed": USER_MISSED
-    }
+    lists = {"ongoing": USER_INPROGRESS, "treated": USER_TREATED, "missed": USER_MISSED}
     # retirer des autres
     for key, store in lists.items():
         lst = store[user_id].setdefault(base, [])
         if rid in lst and key != target:
             lst.remove(rid)
-            if key == "ongoing":
-                inc_stat(user_id, "cases", -1)
-            if key == "missed":
-                inc_stat(user_id, "missed", -1)
-
+            if key == "ongoing": inc_stat(user_id, "cases", -1)
+            if key == "missed": inc_stat(user_id, "missed", -1)
     # ajouter dans la cible
     dst = lists[target][user_id].setdefault(base, [])
     if rid not in dst:
         dst.append(rid)
-        if target == "ongoing":
-            inc_stat(user_id, "cases", +1)
-        elif target == "treated":
-            inc_stat(user_id, "treated", +1)
-        elif target == "missed":
-            inc_stat(user_id, "missed", +1)
+        if target == "ongoing": inc_stat(user_id, "cases", +1)
+        elif target == "treated": inc_stat(user_id, "treated", +1)
+        elif target == "missed": inc_stat(user_id, "missed", +1)
 
 @router.callback_query(F.data.startswith("rec:ask:"))
 async def rec_ask(cb: CallbackQuery):
@@ -987,7 +938,7 @@ async def rec_ask(cb: CallbackQuery):
         return await show_page(cb, "Sélectionne le RDV à annuler :", InlineKeyboardMarkup(inline_keyboard=rows))
 
     if action == "ongoing":
-        # Sélection du calleur (pas de confirmation), supprimer l'écran après choix
+        # Sélection du calleur
         callers = [c for c in CALLERS.get(user_id, []) if c.get("active", True)]
         if not callers:
             rows = [
@@ -1005,30 +956,35 @@ async def rec_ask(cb: CallbackQuery):
         return await show_page(cb, "Qui prend l’appel ?", InlineKeyboardMarkup(inline_keyboard=rows))
 
     if action == "finish":
-        # appliquer directement ici (bug corrigé: pas de cb.replace)
         _exclusive_move(user_id, base, rid, "treated")
-        # enregistrer le calleur qui a pris l'appel si connu
+        # conserver dernier calleur, retirer l'assign en cours
         assign = REC_ASSIGN[user_id].get(base, {}).pop(rid, None)
-        TREATED_META[user_id].setdefault(base, {})
-        TREATED_META[user_id][base][rid] = {
-            "caller_id": assign["caller_id"] if assign else None,
+        if assign:
+            REC_LAST_CALLER[user_id].setdefault(base, {})[rid] = {
+                "caller_id": assign["caller_id"], "name": assign["name"], "last_iso": datetime.now(TZ).isoformat()
+            }
+        TREATED_META[user_id].setdefault(base, {})[rid] = {
+            "caller_id": (assign or REC_LAST_CALLER[user_id].get(base, {}).get(rid, {})).get("caller_id"),
             "at_iso": datetime.now(TZ).isoformat()
         }
-        await delete_if_not_fiche(cb.message)
         await safe_cb_answer(cb, "🟢 Fin d’appel — classé en 'traités'.")
         rec2 = find_record(base, rid)
         if rec2:
-            await send_record_card(cb.message.chat.id, user_id, base, rec2)
+            await refresh_record_view(cb, user_id, base, rec2)
         return
 
     if action == "missed":
         _exclusive_move(user_id, base, rid, "missed")
-        REC_ASSIGN[user_id].get(base, {}).pop(rid, None)
-        await delete_if_not_fiche(cb.message)
+        # conserver dernier calleur, mais retirer l'assign en cours
+        assign = REC_ASSIGN[user_id].get(base, {}).pop(rid, None)
+        if assign:
+            REC_LAST_CALLER[user_id].setdefault(base, {})[rid] = {
+                "caller_id": assign["caller_id"], "name": assign["name"], "last_iso": datetime.now(TZ).isoformat()
+            }
         await safe_cb_answer(cb, "📵 Marqué « À rappeler ».")
         rec2 = find_record(base, rid)
         if rec2:
-            await send_record_card(cb.message.chat.id, user_id, base, rec2)
+            await refresh_record_view(cb, user_id, base, rec2)
         return
 
 @router.callback_query(F.data.startswith("rec:do:"))
@@ -1054,13 +1010,14 @@ async def rec_do(cb: CallbackQuery):
             return await safe_cb_answer(cb, "Calleur introuvable.")
         _exclusive_move(user_id, base, rid, "ongoing")
         REC_ASSIGN[user_id].setdefault(base, {})[rid] = {
-            "caller_id": caller_id,
-            "name": c["name"],
-            "since_iso": datetime.now(TZ).isoformat()
+            "caller_id": caller_id, "name": c["name"], "since_iso": datetime.now(TZ).isoformat()
         }
-        await delete_if_not_fiche(cb.message)  # supprime l'écran "Qui prend l'appel ?"
+        REC_LAST_CALLER[user_id].setdefault(base, {})[rid] = {
+            "caller_id": caller_id, "name": c["name"], "last_iso": datetime.now(TZ).isoformat()
+        }
         await safe_cb_answer(cb, f"📞 En ligne — {c['name']}")
-        return await send_record_card(cb.message.chat.id, user_id, base, rec)
+        await refresh_record_view(cb, user_id, base, rec)
+        return
 
 # ----------------- RDV (date -> time) + annulation confirm -----------------
 def get_upcoming_rdvs(user_id: int, base: str, rid: Optional[str] = None):
@@ -1085,10 +1042,7 @@ def _refresh_record_next_rdv(user_id: int, base: str, rid: str):
     if not rec:
         return
     upcoming = get_upcoming_rdvs(user_id, base, rid)
-    if upcoming:
-        rec["next_rdv_iso"] = upcoming[0][0].isoformat()
-    else:
-        rec["next_rdv_iso"] = None
+    rec["next_rdv_iso"] = upcoming[0][0].isoformat() if upcoming else None
 
 def _cancel_rdv_by_id(user_id: int, base: str, rdv_id: str) -> Tuple[bool, Optional[str]]:
     lst = USER_RDV.get(user_id, {}).get(base, [])
@@ -1132,16 +1086,13 @@ async def rec_rdv_date(cb: CallbackQuery):
         return await safe_cb_answer(cb)
 
     now = datetime.now(TZ)
-    # Génère des créneaux de 30 min sur 24h, en commençant au prochain créneau pour aujourd’hui
+    # slots 30 min sur 24h ; si aujourd’hui, à partir du prochain créneau
     slots = []
     start_dt = datetime.combine(d, time(0, 0), tzinfo=TZ)
     if d == now.date():
         start_dt = round_up_to_next_halfhour(now)
         if start_dt.date() != d:
-            # si on a basculé au jour suivant, alors plus de créneau pour aujourd’hui
             slots = []
-        else:
-            pass
     end_dt = datetime.combine(d, time(23, 30), tzinfo=TZ)
     cur = start_dt
     while cur <= end_dt:
@@ -1149,19 +1100,16 @@ async def rec_rdv_date(cb: CallbackQuery):
         cur = cur + timedelta(minutes=30)
 
     if not slots:
-        rows = [[InlineKeyboardButton(text="Aucun créneau restant aujourd’hui", callback_data=f"rec:ask:rdv:{base}:{rid}")]]
-        rows.append([InlineKeyboardButton(text="Retour dates", callback_data=f"rec:ask:rdv:{base}:{rid}")])
+        rows = [[InlineKeyboardButton(text="Retour dates", callback_data=f"rec:ask:rdv:{base}:{rid}")]]
         return await show_page(cb, f"Aucun créneau pour le {d.strftime('%d/%m')} (journée écoulée).", InlineKeyboardMarkup(inline_keyboard=rows))
 
     rows = []
     for s in slots:
         hhmm = s.strftime("%H%M")
-        rows.append([InlineKeyboardButton(
-            text=s.strftime("%H:%M"),
-            callback_data=f"rec:rdv_time:{base}:{rid}:{ds}:{hhmm}"
-        )])
+        rows.append([InlineKeyboardButton(text=s.strftime("%H:%M"),
+                                          callback_data=f"rec:rdv_time:{base}:{rid}:{ds}:{hhmm}")])
     rows.append([InlineKeyboardButton(text="Retour dates", callback_data=f"rec:ask:rdv:{base}:{rid}")])
-    await show_page(cb, f"Choisis une heure pour le {french_weekday(d)} {d.strftime('%d/%m')} :", InlineKeyboardMarkup(inline_keyboard=rows))
+    await show_page(cb, f"Choisis une heure pour {french_weekday(d)} {d.strftime('%d/%m')} :", InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith("rec:rdv_time:"))
 async def rec_rdv_time(cb: CallbackQuery):
@@ -1203,9 +1151,8 @@ async def rec_rdv_create(cb: CallbackQuery):
         "sent": False, "chat_id": cb.message.chat.id
     })
     rec["next_rdv_iso"] = at.isoformat()
-    await delete_if_not_fiche(cb.message)
     await safe_cb_answer(cb, f"📅 RDV placé pour {format_dt_short(at)} (rappel 5 min avant).")
-    await send_record_card(cb.message.chat.id, user_id, base, rec)
+    await refresh_record_view(cb, user_id, base, rec)
 
 @router.callback_query(F.data.startswith("rdv:confirm_cancel:"))
 async def rdv_confirm_cancel(cb: CallbackQuery):
@@ -1229,11 +1176,10 @@ async def rdv_do_cancel(cb: CallbackQuery):
         return await safe_cb_answer(cb)
     user_id = cb.from_user.id
     ok, _ = _cancel_rdv_by_id(user_id, base, rdv_id)
-    await delete_if_not_fiche(cb.message)
     await safe_cb_answer(cb, "🗑️ RDV annulé." if ok else "RDV introuvable ou déjà passé.")
     rec = find_record(base, rid)
     if rec:
-        await send_record_card(cb.message.chat.id, user_id, base, rec)
+        await refresh_record_view(cb, user_id, base, rec)
 
 @router.callback_query(F.data == "home:rdv")
 async def list_rdv(cb: CallbackQuery):
@@ -1274,9 +1220,8 @@ def callers_keyboard(user_id: int) -> InlineKeyboardMarkup:
     base = get_active_db(user_id)
     rows = []
     for c in CALLERS.get(user_id, [])[:50]:
-        on_today, tr_today = caller_counts(user_id, base, c["id"])
         rows.append([
-            InlineKeyboardButton(text=f"👀 Fiches ({on_today} en ligne • {tr_today} traités ajd)", callback_data=f"home:callers:view:{c['id']}"),
+            InlineKeyboardButton(text=f"📄 Fiche — {c['name']}", callback_data=f"home:callers:view:{c['id']}"),
             InlineKeyboardButton(text="📝 Renommer", callback_data=f"home:callers:rename:{c['id']}"),
         ])
         toggle_label = "Désactiver" if c.get("active", True) else "Activer"
@@ -1348,7 +1293,7 @@ async def home_callers_rename(cb: CallbackQuery):
     old = next((c for c in CALLERS[user_id] if c["id"] == cid), None)
     if not old:
         return await safe_cb_answer(cb, "Introuvable.")
-    # supprime l'ancien puis demande un nouveau nom
+    # suppression de l'ancien puis demande du nouveau nom (flux léger)
     CALLERS[user_id] = [c for c in CALLERS[user_id] if c["id"] != cid]
     USER_STATE[user_id]["awaiting_caller_name"] = True
     text = f"Renommage — envoie le nouveau nom pour « {old['name']} » (ancien supprimé, nouveau créé)."
@@ -1387,16 +1332,14 @@ async def callers_view(cb: CallbackQuery):
         for rid in ongoing[:50]:
             rec = find_record(base, rid)
             if not rec: continue
-            label = f"{pretty_name(rec)} — {(rec.get('ville') or '—')} ({rec.get('cp') or '—'})"
-            rows.append([InlineKeyboardButton(text=label, callback_data=f"rec:view:{base}:{rid}")])
+            rows.append([InlineKeyboardButton(text=f"Fiche — {c['name']}", callback_data=f"rec:view:{base}:{rid}")])
         lines.append("")
     if treated_today:
         lines.append("— Traités aujourd’hui :")
         for rid in treated_today[:50]:
             rec = find_record(base, rid)
             if not rec: continue
-            label = f"{pretty_name(rec)} — {(rec.get('ville') or '—')} ({rec.get('cp') or '—'})"
-            rows.append([InlineKeyboardButton(text=label, callback_data=f"rec:view:{base}:{rid}")])
+            rows.append([InlineKeyboardButton(text=f"Fiche — {c['name']}", callback_data=f"rec:view:{base}:{rid}")])
         lines.append("")
     if not ongoing and not treated_today:
         lines.append("Aucune fiche en ligne ou traitée aujourd’hui.")
